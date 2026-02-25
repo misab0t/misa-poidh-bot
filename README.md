@@ -58,6 +58,8 @@ Farcaster Mention                        Cron (every 30min)
 GOOGLE_API_KEY=your-gemini-api-key     # Required: for AI evaluation
 RPC_URL=https://mainnet.base.org       # Required: chain RPC
 PRIVATE_KEY=0x...                      # Required: EOA private key
+NEYNAR_API_KEY=your-neynar-api-key     # Required: for Farcaster posting
+NEYNAR_SIGNER_UUID=your-signer-uuid    # Required: approved Farcaster signer
 POIDH_CHAIN=base                       # Optional: base (default), arbitrum, or degen
 ```
 
@@ -94,7 +96,7 @@ node poidh-bot.js pending
 ## Bounty Lifecycle
 
 ### Solo Bounty
-1. `createSoloBounty` → escrow fundsact
+1. `createSoloBounty` → escrow funds
 2. Monitor claims every 30 min → Gemini vision evaluates each
 3. Post evaluation for each claim on Farcaster
 4. After 24h, if best score >= 15/30 → post full ranking → `acceptClaim` → post explanation
@@ -154,6 +156,7 @@ node poidh-cli.js withdraw
 |------|---------|
 | `bot-state.json` | Current phase, bounty details, evaluated claims, winner |
 | `bot-log.json` | Full audit trail of all actions |
+| `bot-summary.txt` | Human-readable status for external systems (Gemini follow-up) |
 | `pending-bounties.json` | Queued bounty creation requests |
 | `balance-snapshot.json` | Wallet balance tracking for payment detection |
 
@@ -167,10 +170,11 @@ node poidh-cli.js withdraw
 
 ## Limitations
 
-- Currently optimized for Base chain (configurable via `POIDH_CHAIN`)
+- Multi-chain supported (Base, Arbitrum, Degen) but primarily tested on Base
 - Gemini API quota limits may delay evaluations
-- No automatic re-creation of bounties after completion
+- Bounties auto-expire after 7 days with no claims, or 5 days if all scores < 15/30
 - Open bounty vote resolution requires 2-day waiting period
+- If vote fails (NO > YES), bounty returns to monitoring for new submissions
 
 ## Social Account
 

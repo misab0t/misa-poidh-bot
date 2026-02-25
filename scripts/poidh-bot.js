@@ -56,22 +56,94 @@ const STATE_FILE = path.join(__dirname, 'bot-state.json');
 const LOG_FILE = path.join(__dirname, 'bot-log.json');
 const PENDING_FILE = path.join(__dirname, 'pending-bounties.json');
 const BALANCE_SNAPSHOT_FILE = path.join(__dirname, 'balance-snapshot.json');
+const LOCK_FILE = path.join(__dirname, '.bot-lock');
+
+// --- Lock to prevent concurrent cron runs ---
+function acquireLock() {
+  try {
+    // Check if stale lock exists (> 10 minutes old)
+    if (fs.existsSync(LOCK_FILE)) {
+      const stat = fs.statSync(LOCK_FILE);
+      const age = Date.now() - stat.mtimeMs;
+      if (age < 10 * 60 * 1000) {
+        const pid = fs.readFileSync(LOCK_FILE, 'utf8').trim();
+        console.log(`Another instance is running (pid ${pid}, ${Math.round(age / 1000)}s ago). Exiting.`);
+        return false;
+      }
+      console.log(`Stale lock found (${Math.round(age / 1000)}s old), removing.`);
+    }
+    fs.writeFileSync(LOCK_FILE, String(process.pid));
+    return true;
+  } catch { return true; }
+}
+
+function releaseLock() {
+  try { fs.unlinkSync(LOCK_FILE); } catch {}
+}
 
 // --- Helpers ---
+
+// Atomic write: write to tmp then rename to prevent corrupted JSON on crash
+function atomicWrite(filePath, data) {
+  const tmp = filePath + '.tmp';
+  fs.writeFileSync(tmp, data);
+  fs.renameSync(tmp, filePath);
+}
+
 function loadState() {
   try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); }
   catch { return null; }
 }
 
 function saveState(state) {
-  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+  atomicWrite(STATE_FILE, JSON.stringify(state, null, 2));
+  updateSummary(state);
 }
 
 function appendLog(entry) {
   let logs = [];
   try { logs = JSON.parse(fs.readFileSync(LOG_FILE, 'utf8')); } catch {}
   logs.push({ ...entry, timestamp: new Date().toISOString() });
-  fs.writeFileSync(LOG_FILE, JSON.stringify(logs, null, 2));
+  // Keep last 500 entries to prevent unbounded growth
+  if (logs.length > 500) logs = logs.slice(-500);
+  atomicWrite(LOG_FILE, JSON.stringify(logs, null, 2));
+}
+
+// --- Export readable summary for external systems (e.g. Farcaster webhook/Gemini) ---
+const SUMMARY_FILE = path.join(__dirname, 'bot-summary.txt');
+
+function updateSummary(state) {
+  if (!state) { state = loadState(); }
+  if (!state) {
+    try { fs.unlinkSync(SUMMARY_FILE); } catch {}
+    return;
+  }
+
+  const webId = state.bountyId + CHAIN.idOffset;
+  let summary = `POIDH BOT STATUS\n`;
+  summary += `Phase: ${state.phase}\n`;
+  summary += `Bounty: "${state.bountyName}" (#${state.bountyId}, web: ${webId})\n`;
+  summary += `URL: ${CHAIN.url}/bounty/${webId}\n`;
+  summary += `Amount: ${state.amount} ETH\n`;
+  summary += `Created: ${state.createdAt}\n`;
+  summary += `Claims evaluated: ${state.evaluatedClaims.length}\n\n`;
+
+  if (state.evaluatedClaims.length > 0) {
+    const sorted = [...state.evaluatedClaims].sort((a, b) => b.score - a.score || a.id - b.id);
+    summary += `EVALUATIONS (ranked):\n`;
+    sorted.forEach((c, i) => {
+      summary += `${i + 1}. Claim #${c.id} — ${c.score}/30 (r:${c.relevance} q:${c.quality} a:${c.authenticity}) — ${c.reasoning}\n`;
+    });
+    summary += '\n';
+  }
+
+  if (state.winner) {
+    summary += `WINNER: Claim #${state.winner.id} — ${state.winner.score}/30\n`;
+    summary += `Reason: ${state.winner.reasoning}\n`;
+    summary += `TX: ${state.acceptTxHash || state.voteTxHash || 'pending'}\n`;
+  }
+
+  fs.writeFileSync(SUMMARY_FILE, summary);
 }
 
 // --- Pending bounty requests ---
@@ -81,7 +153,7 @@ function loadPending() {
 }
 
 function savePending(list) {
-  fs.writeFileSync(PENDING_FILE, JSON.stringify(list, null, 2));
+  atomicWrite(PENDING_FILE, JSON.stringify(list, null, 2));
 }
 
 function addPendingRequest(name, description, amount, requestedBy) {
@@ -97,7 +169,7 @@ function loadBalanceSnapshot() {
 }
 
 function saveBalanceSnapshot(balance) {
-  fs.writeFileSync(BALANCE_SNAPSHOT_FILE, JSON.stringify({ balance, timestamp: new Date().toISOString() }));
+  atomicWrite(BALANCE_SNAPSHOT_FILE, JSON.stringify({ balance, timestamp: new Date().toISOString() }));
 }
 
 // Check if funds arrived and create bounty if so
@@ -125,19 +197,35 @@ async function checkPendingFunds() {
 
   console.log(`Balance increased by ${increase.toFixed(6)} ETH (${snapshot.balance} -> ${currentBalance})`);
 
-  // Match the oldest pending request whose amount is closest to the increase
-  const matched = pending.find(p => {
+  // Find best match: closest amount to the increase (within 20% tolerance, prefer smallest delta)
+  let matched = null;
+  let bestDelta = Infinity;
+  for (const p of pending) {
     const requested = parseFloat(p.amount);
-    return increase >= requested * 0.9; // 10% tolerance for gas rounding
-  });
+    const delta = Math.abs(increase - requested);
+    const tolerance = requested * 0.2; // 20% tolerance for gas
+    if (delta <= tolerance && delta < bestDelta) {
+      matched = p;
+      bestDelta = delta;
+    }
+  }
+
+  // Fallback: if no close match, try >= 90% (someone may have sent a bit extra)
+  if (!matched) {
+    matched = pending.find(p => {
+      const requested = parseFloat(p.amount);
+      return increase >= requested * 0.9 && increase <= requested * 1.5;
+    });
+  }
 
   if (!matched) {
-    console.log(`Balance increased but no pending request matches ${increase.toFixed(6)} ETH`);
+    console.log(`Balance increased by ${increase.toFixed(6)} ETH but no pending request matches (${pending.length} pending)`);
     saveBalanceSnapshot(currentBalance);
     return;
   }
 
-  console.log(`Matched pending request: "${matched.name}" for ${matched.amount} ETH from @${matched.requestedBy}`);
+  const actualDelta = Math.abs(increase - parseFloat(matched.amount));
+  console.log(`Matched pending request: "${matched.name}" for ${matched.amount} ETH from @${matched.requestedBy} (delta: ${actualDelta.toFixed(6)})`);
 
   // Remove from pending
   const remaining = pending.filter(p => p !== matched);
@@ -167,10 +255,8 @@ function getWallet() {
   const rpcUrl = process.env.RPC_URL || 'https://mainnet.base.org';
   let privateKey = process.env.PRIVATE_KEY;
   if (!privateKey) {
-    const creds = JSON.parse(fs.readFileSync(
-      path.join(__dirname, '..', '..', 'farcaster-agent', 'scripts', 'credentials.json'), 'utf8'
-    ));
-    privateKey = creds.custodyPrivateKey;
+    console.error('PRIVATE_KEY env var not set');
+    process.exit(1);
   }
   if (!privateKey.startsWith('0x')) privateKey = '0x' + privateKey;
   const provider = new ethers.JsonRpcProvider(rpcUrl);
@@ -182,35 +268,41 @@ function getContract(wallet) {
   return new ethers.Contract(CHAIN.contract, ABI, wallet);
 }
 
-function fetch(url) {
+function fetch(url, timeoutMs = 30000, _redirects = 0) {
   return new Promise((resolve, reject) => {
+    if (_redirects > 5) return reject(new Error('Too many redirects'));
     const mod = url.startsWith('https') ? https : http;
-    mod.get(url, { headers: { 'User-Agent': 'poidh-bot/1.0' } }, (res) => {
+    const req = mod.get(url, { headers: { 'User-Agent': 'poidh-bot/1.0' }, timeout: timeoutMs }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        return fetch(res.headers.location).then(resolve).catch(reject);
+        return fetch(res.headers.location, timeoutMs, _redirects + 1).then(resolve).catch(reject);
       }
       let data = '';
       res.on('data', c => data += c);
       res.on('end', () => resolve({ status: res.statusCode, data }));
-    }).on('error', reject);
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error(`Fetch timeout after ${timeoutMs}ms: ${url}`)); });
   });
 }
 
-function fetchBuffer(url) {
+function fetchBuffer(url, timeoutMs = 30000, _redirects = 0) {
   return new Promise((resolve, reject) => {
+    if (_redirects > 5) return reject(new Error('Too many redirects'));
     const mod = url.startsWith('https') ? https : http;
-    mod.get(url, { headers: { 'User-Agent': 'poidh-bot/1.0' } }, (res) => {
+    const req = mod.get(url, { headers: { 'User-Agent': 'poidh-bot/1.0' }, timeout: timeoutMs }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        return fetchBuffer(res.headers.location).then(resolve).catch(reject);
+        return fetchBuffer(res.headers.location, timeoutMs, _redirects + 1).then(resolve).catch(reject);
       }
       const chunks = [];
       res.on('data', c => chunks.push(c));
       res.on('end', () => resolve({ status: res.statusCode, data: Buffer.concat(chunks), contentType: res.headers['content-type'] || '' }));
-    }).on('error', reject);
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error(`Fetch timeout after ${timeoutMs}ms: ${url}`)); });
   });
 }
 
-function postJSON(url, body, headers = {}) {
+function postJSON(url, body, headers = {}, timeoutMs = 30000) {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
     const data = JSON.stringify(body);
@@ -219,6 +311,7 @@ function postJSON(url, body, headers = {}) {
       port: u.port || 443,
       path: u.pathname + u.search,
       method: 'POST',
+      timeout: timeoutMs,
       headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data), ...headers },
     };
     const mod = u.protocol === 'https:' ? https : http;
@@ -228,6 +321,7 @@ function postJSON(url, body, headers = {}) {
       res.on('end', () => resolve({ status: res.statusCode, data: d }));
     });
     req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error(`POST timeout after ${timeoutMs}ms: ${url}`)); });
     req.write(data);
     req.end();
   });
@@ -242,7 +336,12 @@ async function evaluateWithGemini(imageUrl, bountyName, bountyDesc, claimName, c
   try {
     const img = await fetchBuffer(imageUrl);
     imageData = img.data.toString('base64');
-    mimeType = img.contentType.includes('png') ? 'image/png' : 'image/jpeg';
+    const ct = img.contentType.toLowerCase();
+    if (ct.includes('png')) mimeType = 'image/png';
+    else if (ct.includes('webp')) mimeType = 'image/webp';
+    else if (ct.includes('gif')) mimeType = 'image/gif';
+    else if (ct.includes('svg')) mimeType = 'image/svg+xml';
+    else mimeType = 'image/jpeg';
   } catch (e) {
     return { score: 0, reasoning: `Could not fetch image: ${e.message}` };
   }
@@ -278,7 +377,9 @@ The "total" should be the sum of the three scores (max 30).`;
 
   const res = await postJSON(
     `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
-    body
+    body,
+    {},
+    60000 // 60s for vision evaluation with large images
   );
 
   try {
@@ -316,16 +417,51 @@ async function resolveClaimImage(claimId, contract, provider) {
   }
 }
 
-// --- Farcaster posting ---
+// --- Farcaster posting via Neynar API ---
 async function postToFarcaster(text) {
-  const cliPath = path.join(__dirname, '..', '..', 'farcaster-agent', 'scripts', 'src', 'farcaster-cli.js');
-  return new Promise((resolve, reject) => {
-    const { execFile } = require('child_process');
-    execFile('node', [cliPath, 'cast', text], { timeout: 30000 }, (err, stdout, stderr) => {
-      if (err) reject(new Error(stderr || err.message));
-      else resolve(stdout.trim());
-    });
+  const apiKey = process.env.NEYNAR_API_KEY;
+  const signerUuid = process.env.NEYNAR_SIGNER_UUID;
+  if (!apiKey || !signerUuid) {
+    console.log('NEYNAR_API_KEY or NEYNAR_SIGNER_UUID not set, skipping Farcaster post.');
+    return null;
+  }
+
+  // Truncate to 320 bytes (Farcaster limit)
+  let truncated = text;
+  if (Buffer.byteLength(truncated, 'utf8') > 320) {
+    // Binary search for max length that fits in 317 bytes (320 - 3 for "...")
+    let lo = 0, hi = truncated.length;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (Buffer.byteLength(truncated.slice(0, mid), 'utf8') <= 317) lo = mid;
+      else hi = mid - 1;
+    }
+    truncated = truncated.slice(0, lo) + '...';
+  }
+
+  const res = await postJSON('https://api.neynar.com/v2/farcaster/cast', {
+    signer_uuid: signerUuid,
+    text: truncated,
+  }, {
+    'x-api-key': apiKey,
   });
+
+  try {
+    const data = JSON.parse(res.data);
+    if (data.success && data.cast) {
+      appendLog({ event: 'farcaster_post_ok', hash: data.cast.hash });
+      return data.cast.hash;
+    }
+    const errMsg = `Unexpected response: ${res.data.slice(0, 200)}`;
+    console.error('Farcaster post:', errMsg);
+    appendLog({ event: 'farcaster_post_failed', reason: errMsg.slice(0, 100) });
+    return null;
+  } catch (e) {
+    const errMsg = res.data?.slice(0, 200) || e.message;
+    console.error('Farcaster post failed:', errMsg);
+    appendLog({ event: 'farcaster_post_failed', reason: errMsg.slice(0, 100) });
+    return null;
+  }
 }
 
 // --- Bot Phases ---
@@ -389,7 +525,6 @@ async function createBounty(opts = {}) {
 
   // Announce on Farcaster
   try {
-    const webId = bountyId + CHAIN.idOffset;
     const chainLabel = CHAIN_NAME.charAt(0).toUpperCase() + CHAIN_NAME.slice(1);
     const typeLabel = type === 'open' ? 'open bounty (anyone can add funds)' : 'bounty';
     const postText = `new ${typeLabel} on poidh: "${name}" — ${amount} ETH on ${chainLabel}\n\n${CHAIN.url}/bounty/${webId}`;
@@ -423,9 +558,18 @@ async function monitorAndEvaluate() {
     return;
   }
 
-  // Fetch claims
-  const claims = await contract.getClaimsByBountyId(state.bountyId, 0);
-  const newClaims = claims.filter(c =>
+  // Fetch all claims (paginate in batches of 10)
+  let allFetchedClaims = [];
+  let offset = 0;
+  while (true) {
+    const batch = await contract.getClaimsByBountyId(state.bountyId, offset);
+    if (batch.length === 0) break;
+    allFetchedClaims = allFetchedClaims.concat(batch);
+    if (batch.length < 10) break;
+    offset += 10;
+  }
+
+  const newClaims = allFetchedClaims.filter(c =>
     !c.accepted && !state.evaluatedClaims.find(ec => ec.id === Number(c.id))
   );
 
@@ -497,7 +641,33 @@ async function selectAndAccept(minWaitHours = 24) {
   }
 
   if (state.evaluatedClaims.length === 0) {
-    console.log('No claims to evaluate.');
+    // If no claims after 7 days, mark as expired so new bounties can be created
+    if (elapsed > 168) {
+      console.log('No claims after 7 days. Marking bounty as expired.');
+      state.phase = 'expired';
+      saveState(state);
+      appendLog({ event: 'bounty_expired', bountyId: state.bountyId, reason: 'no claims after 7 days' });
+      try {
+        const webId = state.bountyId + CHAIN.idOffset;
+        await postToFarcaster(`bounty "${state.bountyName}" expired — no valid claims after 7 days\n\n${CHAIN.url}/bounty/${webId}`);
+      } catch (e) { /* ignore */ }
+    } else {
+      console.log('No claims to evaluate.');
+    }
+    return;
+  }
+
+  // If best score stays below threshold for 5 days after first claim, give up
+  const bestScore = Math.max(...state.evaluatedClaims.map(c => c.score));
+  if (bestScore < 15 && elapsed > 120) {
+    console.log(`Best score ${bestScore}/30 after 5 days. Marking bounty as expired.`);
+    state.phase = 'expired';
+    saveState(state);
+    appendLog({ event: 'bounty_expired', bountyId: state.bountyId, reason: `best score ${bestScore}/30 after 5 days` });
+    try {
+      const webId = state.bountyId + CHAIN.idOffset;
+      await postToFarcaster(`bounty "${state.bountyName}" expired — best submission scored ${bestScore}/30, below threshold\n\n${CHAIN.url}/bounty/${webId}`);
+    } catch (e) { /* ignore */ }
     return;
   }
 
@@ -544,8 +714,8 @@ async function selectAndAccept(minWaitHours = 24) {
   }
   saveState(state);
 
-  // Sort all claims by score
-  const allClaims = [...state.evaluatedClaims].sort((a, b) => b.score - a.score);
+  // Sort all claims by score (tie-break: earlier claim ID wins)
+  const allClaims = [...state.evaluatedClaims].sort((a, b) => b.score - a.score || a.id - b.id);
   const validClaims = allClaims.filter(c => c.score > 0);
   if (validClaims.length === 0) {
     console.log('No valid claims (all scored 0).');
@@ -568,10 +738,10 @@ async function selectAndAccept(minWaitHours = 24) {
       const medal = i === 0 ? '1st' : i === 1 ? '2nd' : i === 2 ? '3rd' : `${i + 1}th`;
       ranking += `${medal}: claim #${c.id} — ${c.score}/30 (r:${c.relevance} q:${c.quality} a:${c.authenticity})\n`;
     });
-    ranking += `\nworst: claim #${allClaims[allClaims.length - 1].id} — ${allClaims[allClaims.length - 1].reasoning}`;
+    if (allClaims.length > 1) {
+      ranking += `\nweakest: claim #${allClaims[allClaims.length - 1].id} — ${allClaims[allClaims.length - 1].reasoning}`;
+    }
     ranking += `\n\n${CHAIN.url}/bounty/${webId}`;
-
-    if (ranking.length > 320) ranking = ranking.slice(0, 317) + '...';
 
     await postToFarcaster(ranking);
     console.log('Posted full ranking on Farcaster.');
@@ -610,7 +780,7 @@ async function selectAndAccept(minWaitHours = 24) {
     try {
       const webId = state.bountyId + CHAIN.idOffset;
       const votePost = `submitted claim #${winner.id} for vote on bounty "${state.bountyName}" — score ${winner.score}/30\n\ncontributors have 2 days to vote\n\n${winner.reasoning}\n\n${CHAIN.url}/bounty/${webId}`;
-      await postToFarcaster(votePost.length > 320 ? votePost.slice(0, 317) + '...' : votePost);
+      await postToFarcaster(votePost);
     } catch (e) {
       console.error('Farcaster vote post failed:', e.message);
     }
@@ -632,7 +802,7 @@ async function selectAndAccept(minWaitHours = 24) {
     try {
       const webId = state.bountyId + CHAIN.idOffset;
       const explanation = `accepted claim #${winner.id} on my poidh bounty "${state.bountyName}" — score ${winner.score}/30\n\n${winner.reasoning}\n\n${CHAIN.url}/bounty/${webId}`;
-      await postToFarcaster(explanation.length > 320 ? explanation.slice(0, 317) + '...' : explanation);
+      await postToFarcaster(explanation);
       appendLog({ event: 'farcaster_explanation', bountyId: state.bountyId });
     } catch (e) {
       console.error('Farcaster post failed:', e.message);
@@ -659,23 +829,47 @@ async function resolveOpenVote() {
     return;
   }
 
-  console.log(`Vote deadline passed. Yes: ${yesWeight}, No: ${noWeight}. Resolving...`);
+  // Check if vote will pass before resolving
+  const totalWeight = BigInt(yesWeight) + BigInt(noWeight);
+  const votePassed = totalWeight > 0n && BigInt(yesWeight) * 2n > totalWeight;
+
+  console.log(`Vote deadline passed. Yes: ${yesWeight}, No: ${noWeight}. ${votePassed ? 'PASSED' : 'FAILED'}. Resolving...`);
   const tx = await contract.resolveVote(state.bountyId);
   console.log(`TX: ${tx.hash}`);
   await tx.wait();
-  console.log('Vote resolved!');
 
-  state.phase = 'accepted';
-  state.acceptTxHash = tx.hash;
-  saveState(state);
-  appendLog({ event: 'vote_resolved', bountyId: state.bountyId, txHash: tx.hash, yesWeight: yesWeight.toString(), noWeight: noWeight.toString() });
+  // Verify on-chain: check if bounty is actually finalized
+  const bounty = await contract.bounties(state.bountyId);
+  const isFinalized = bounty.claimer !== ethers.ZeroAddress;
 
-  try {
-    const webId = state.bountyId + CHAIN.idOffset;
-    const resolvePost = `vote resolved on bounty "${state.bountyName}" — claim #${state.winner.id} wins!\n\nyes: ${yesWeight}, no: ${noWeight}\n\n${CHAIN.url}/bounty/${webId}`;
-    await postToFarcaster(resolvePost.length > 320 ? resolvePost.slice(0, 317) + '...' : resolvePost);
-  } catch (e) {
-    console.error('Farcaster resolve post failed:', e.message);
+  if (isFinalized) {
+    console.log('Vote resolved — claim accepted!');
+    state.phase = 'accepted';
+    state.acceptTxHash = tx.hash;
+    saveState(state);
+    appendLog({ event: 'vote_resolved', bountyId: state.bountyId, txHash: tx.hash, result: 'accepted', yesWeight: yesWeight.toString(), noWeight: noWeight.toString() });
+
+    try {
+      const webId = state.bountyId + CHAIN.idOffset;
+      await postToFarcaster(`vote resolved on bounty "${state.bountyName}" — claim #${state.winner.id} wins!\n\nyes: ${yesWeight}, no: ${noWeight}\n\n${CHAIN.url}/bounty/${webId}`);
+    } catch (e) {
+      console.error('Farcaster resolve post failed:', e.message);
+    }
+  } else {
+    console.log('Vote resolved but claim was NOT accepted (vote failed). Returning to monitoring.');
+    state.phase = 'monitoring';
+    state.winner = null;
+    state.voteTxHash = null;
+    state.voteSubmittedAt = null;
+    saveState(state);
+    appendLog({ event: 'vote_failed', bountyId: state.bountyId, txHash: tx.hash, yesWeight: yesWeight.toString(), noWeight: noWeight.toString() });
+
+    try {
+      const webId = state.bountyId + CHAIN.idOffset;
+      await postToFarcaster(`vote on bounty "${state.bountyName}" did not pass (yes: ${yesWeight}, no: ${noWeight}). reopening for new submissions.\n\n${CHAIN.url}/bounty/${webId}`);
+    } catch (e) {
+      console.error('Farcaster vote failed post failed:', e.message);
+    }
   }
 }
 
@@ -698,6 +892,15 @@ async function status() {
   }
   const elapsed = (Date.now() - new Date(state.createdAt).getTime()) / (1000 * 60 * 60);
   console.log(`Time elapsed: ${elapsed.toFixed(1)}h`);
+
+  // Check recent Farcaster post failures
+  try {
+    const logs = JSON.parse(fs.readFileSync(LOG_FILE, 'utf8'));
+    const recent = logs.slice(-50);
+    const fails = recent.filter(l => l.event === 'farcaster_post_failed').length;
+    const oks = recent.filter(l => l.event === 'farcaster_post_ok').length;
+    if (fails > 0) console.log(`Farcaster posts (last 50 logs): ${oks} ok, ${fails} failed`);
+  } catch {}
 }
 
 // --- CLI ---
@@ -749,10 +952,13 @@ Commands:
         await status();
         break;
       case 'run':
-        await checkPendingFunds();
-        await resolveOpenVote();
-        await monitorAndEvaluate();
-        await selectAndAccept(parseInt(args[0]) || 24);
+        if (!acquireLock()) break;
+        try {
+          await checkPendingFunds();
+          await resolveOpenVote();
+          await monitorAndEvaluate();
+          await selectAndAccept(parseInt(args[0]) || 24);
+        } finally { releaseLock(); }
         break;
       case 'queue': {
         const opts = parseStartArgs(args);

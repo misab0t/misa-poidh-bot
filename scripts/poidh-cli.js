@@ -60,16 +60,8 @@ function loadConfig() {
 
   let privateKey = process.env.PRIVATE_KEY;
   if (!privateKey) {
-    // fallback: read from farcaster-agent credentials
-    try {
-      const creds = JSON.parse(fs.readFileSync(
-        path.join(__dirname, '..', '..', 'farcaster-agent', 'scripts', 'credentials.json'), 'utf8'
-      ));
-      privateKey = creds.custodyPrivateKey;
-    } catch (e) {
-      console.error('PRIVATE_KEY env not set and credentials.json not found');
-      process.exit(1);
-    }
+    console.error('PRIVATE_KEY env var not set');
+    process.exit(1);
   }
   if (!privateKey.startsWith('0x')) privateKey = '0x' + privateKey;
 
@@ -238,7 +230,7 @@ Commands:
   withdraw [recipientAddress]
   min-amounts
 
-Env vars: POIDH_CHAIN (base|arbitrum|degen), RPC_URL, PRIVATE_KEY (optional, falls back to farcaster credentials)
+Env vars: POIDH_CHAIN (base|arbitrum|degen), RPC_URL, PRIVATE_KEY
 `;
 
 (async () => {

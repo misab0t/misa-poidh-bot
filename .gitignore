@@ -1,0 +1,7 @@
+node_modules/
+bot-state.json
+bot-log.json
+pending-bounties.json
+balance-snapshot.json
+credentials.json
+.env

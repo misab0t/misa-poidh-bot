@@ -1,0 +1,10 @@
+{
+  "name": "poidh-bounty",
+  "version": "1.0.0",
+  "description": "poidh on-chain bounty skill for Misa",
+  "main": "poidh-cli.js",
+  "dependencies": {
+    "ethers": "^6.16.0"
+  },
+  "type": "commonjs"
+}

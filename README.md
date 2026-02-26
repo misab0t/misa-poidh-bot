@@ -23,7 +23,7 @@ Farcaster Mention                        Cron (every 30min)
                                                  │
                               ┌───────────────────┼────────────────────┐
                               ▼                   ▼                    ▼
-                          PoidhV3             Gemini 2.0           Farcaster
+                          PoidhV3             Gemini 3             Farcaster
                          Contract            Flash Vision         (Explain)
                           (Base)             (Evaluate)
 ```
@@ -32,7 +32,7 @@ Farcaster Mention                        Cron (every 30min)
 
 1. **No human signing** — Bot controls its own EOA wallet via private key
 2. **Automated scheduling** — Cron runs `poidh-bot.js run` every 30 minutes
-3. **AI evaluation** — Gemini 2.0 Flash vision scores each submission on relevance, quality, and authenticity (0-30 scale)
+3. **AI evaluation** — Gemini 3 Flash vision scores each submission on relevance, quality, and authenticity (0-30 scale), with dedicated AI-generated image detection
 4. **Deterministic selection** — Highest scoring claim above threshold (15/30) wins after 24h minimum wait
 5. **On-chain execution** — `acceptClaim` (solo) or `submitClaimForVote` + `resolveVote` (open bounty) called programmatically
 6. **Gemini health check** — Before settlement, verifies Gemini API is responding to prevent fallback-induced errors
@@ -116,13 +116,13 @@ node poidh-bot.js pending
 
 ## Evaluation Logic
 
-Each claim is scored by Gemini 2.0 Flash vision:
+Each claim is scored by Gemini 3 Flash vision:
 
 | Criterion | Score | What it measures |
 |-----------|-------|-----------------|
 | Relevance | 0-10 | Does the image match the bounty description? |
 | Quality | 0-10 | Is it clear, well-composed, and convincing? |
-| Authenticity | 0-10 | Does it appear genuine and original? |
+| Authenticity | 0-10 | Is it a real photo, not AI-generated? Checks hands/fingers, text, skin texture, eyes, background consistency, lighting, sensor noise. Strong AI indicators → 0-2, suspicious → 3-5, clearly real → 8-10. |
 
 - **Total**: Sum of three scores (max 30)
 - **Minimum threshold**: 15/30 to be eligible
@@ -163,7 +163,7 @@ node poidh-cli.js withdraw
 ## Assumptions
 
 - Bounties require **real-world actions** (photos, videos, physical tasks)
-- Bot uses Gemini 2.0 Flash for vision evaluation — edge cases may be misjudged
+- Bot uses Gemini 3 Flash for vision evaluation — edge cases may be misjudged
 - Single image evaluation per claim (video evaluated by thumbnail/metadata)
 - Cron must be running for autonomous operation
 - Bot wallet needs sufficient ETH for gas + bounty amounts

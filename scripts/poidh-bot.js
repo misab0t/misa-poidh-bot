@@ -359,7 +359,19 @@ The attached image is the submission proof.
 Evaluate on these criteria (0-10 each):
 1. RELEVANCE: Does the image match what the bounty asked for?
 2. QUALITY: Is the image clear, well-composed, and convincing?
-3. AUTHENTICITY: Does it appear genuine and original (not AI-generated, not a screenshot of someone else's work)?
+3. AUTHENTICITY: Is this a real photograph, not AI-generated?
+   Check carefully for these AI-generation signs:
+   - Hands/fingers: wrong number, fused, melted, extra joints
+   - Text/signs: garbled, misspelled, or nonsensical letters
+   - Skin: too smooth, waxy, plastic-looking, uncanny valley
+   - Eyes: asymmetric pupils, different iris patterns, unnaturally sharp
+   - Background: objects that blur/merge/dissolve, impossible geometry
+   - Lighting: inconsistent shadows, light coming from multiple directions
+   - Overall: too perfect, too clean, no sensor noise, no lens distortion
+   - Style: looks like Midjourney/DALL-E/Stable Diffusion output
+   If you detect ANY strong AI indicators, score authenticity 0-2.
+   If uncertain but suspicious, score 3-5.
+   Only score 8-10 if the image clearly looks like a real camera photo.
 
 Respond in this exact JSON format only, no other text:
 {"relevance": N, "quality": N, "authenticity": N, "total": N, "reasoning": "one sentence explanation"}
@@ -376,7 +388,7 @@ The "total" should be the sum of the three scores (max 30).`;
   };
 
   const res = await postJSON(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`,
     body,
     {},
     60000 // 60s for vision evaluation with large images
@@ -676,7 +688,7 @@ async function selectAndAccept(minWaitHours = 24) {
   if (apiKey) {
     try {
       const testRes = await postJSON(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`,
         { contents: [{ parts: [{ text: 'reply with "ok"' }] }] }
       );
       const testData = JSON.parse(testRes.data);

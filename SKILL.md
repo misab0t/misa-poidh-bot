@@ -5,7 +5,7 @@ description: "Post bounties and evaluate/accept winning submissions on poidh (pi
 
 # poidh-bounty — 链上悬赏 skill
 
-钱包: 复用 farcaster-agent 的 custodyPrivateKey（自动读取）
+钱包: 通过 PRIVATE_KEY 环境变量配置
 链: Base（默认）/ Arbitrum / Degen
 费用: 只需 gas + 悬赏金额，poidh 收 2.5% 手续费
 
@@ -62,7 +62,10 @@ POIDH_CHAIN=base RPC_URL=$BASE_RPC_URL node poidh-cli.js <command> [args]
 |------|------|
 | POIDH_CHAIN | 目标链：base / arbitrum / degen（默认 base） |
 | RPC_URL | 链的 RPC URL |
-| PRIVATE_KEY | （可选）不设则自动读 farcaster-agent 的 custodyPrivateKey |
+| PRIVATE_KEY | 必填，EOA 钱包私钥 |
+| NEYNAR_API_KEY | Neynar API key（Farcaster 发帖用） |
+| NEYNAR_SIGNER_UUID | Neynar 已授权的 signer UUID |
+| GOOGLE_API_KEY | Gemini API key（AI 评估用） |
 
 ## 最低金额
 

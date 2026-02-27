@@ -81,8 +81,23 @@ node poidh-bot.js run
 # Check status
 node poidh-bot.js status
 
+# Accept a specific claim by ID
+node poidh-bot.js accept-claim 7
+
+# Auto-select the best claim (no minimum wait)
+node poidh-bot.js select-winner
+
+# Resolve an open bounty vote after deadline
+node poidh-bot.js resolve-vote
+
+# Withdraw pending payouts
+node poidh-bot.js withdraw
+
+# Withdraw to a specific address
+node poidh-bot.js withdraw 0x1234...
+
 # Queue a pending bounty request (for webhook integration)
-node poidh-bot.js queue --name "Sunset photo" --amount 0.002 --from "kenny"
+node poidh-bot.js queue --name "Sunset photo" --amount 0.002 --from "kenny" --chain base
 
 # View pending requests
 node poidh-bot.js pending

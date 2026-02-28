@@ -53,11 +53,40 @@ const NFT_ABI = [
   'function tokenURI(uint256 tokenId) view returns (string)',
 ];
 
-const STATE_FILE = path.join(__dirname, 'bot-state.json');
-const LOG_FILE = path.join(__dirname, 'bot-log.json');
-const PENDING_FILE = path.join(__dirname, 'pending-bounties.json');
-const BALANCE_SNAPSHOT_FILE = path.join(__dirname, 'balance-snapshot.json');
-const LOCK_FILE = path.join(__dirname, '.bot-lock');
+const SKILL_ROOT = path.resolve(__dirname, '..');
+const RUNTIME_DIR = path.join(SKILL_ROOT, 'runtime');
+const TMP_DIR = path.join(SKILL_ROOT, 'tmp');
+
+const STATE_FILE = path.join(RUNTIME_DIR, 'bot-state.json');
+const LOG_FILE = path.join(RUNTIME_DIR, 'bot-log.json');
+const PENDING_FILE = path.join(RUNTIME_DIR, 'pending-bounties.json');
+const BALANCE_SNAPSHOT_FILE = path.join(RUNTIME_DIR, 'balance-snapshot.json');
+const LOCK_FILE = path.join(RUNTIME_DIR, '.bot-lock');
+
+function initRuntimeLayout() {
+  fs.mkdirSync(RUNTIME_DIR, { recursive: true });
+  fs.mkdirSync(TMP_DIR, { recursive: true });
+
+  const runtimeFiles = [
+    'bot-state.json',
+    'bot-log.json',
+    'pending-bounties.json',
+    'balance-snapshot.json',
+    '.bot-lock',
+  ];
+
+  for (const file of runtimeFiles) {
+    const legacy = path.join(__dirname, file);
+    const next = path.join(RUNTIME_DIR, file);
+    try {
+      if (fs.existsSync(legacy) && !fs.existsSync(next)) {
+        fs.renameSync(legacy, next);
+      }
+    } catch {}
+  }
+}
+
+initRuntimeLayout();
 
 // --- Lock to prevent concurrent cron runs ---
 function acquireLock() {
@@ -513,7 +542,7 @@ The "total" should be the sum of the three scores (max 30).`;
     `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`,
     body,
     {},
-    60000 // 60s for vision evaluation with large images
+    60000
   );
 
   try {
@@ -532,9 +561,11 @@ The "total" should be the sum of the three scores (max 30).`;
 }
 
 // --- Resolve claim image URL ---
+let _cachedNftAddr = null;
 async function resolveClaimImage(claimId, contract, provider) {
   try {
-    const nftAddr = await contract.poidhNft();
+    if (!_cachedNftAddr) _cachedNftAddr = await contract.poidhNft();
+    const nftAddr = _cachedNftAddr;
     const nft = new ethers.Contract(nftAddr, NFT_ABI, provider);
     let uri = await nft.tokenURI(claimId);
 
@@ -549,7 +580,7 @@ async function resolveClaimImage(claimId, contract, provider) {
       else return null;
     } else {
       const res = await fetch(uri);
-      metaText = res.data;
+      metaText = await res.text();
     }
 
     try {
@@ -562,6 +593,7 @@ async function resolveClaimImage(claimId, contract, provider) {
       return uri.startsWith('data:') ? null : uri;
     }
   } catch (e) {
+    console.error("  resolveClaimImage ERROR:", e.message);
     return null;
   }
 }
@@ -799,6 +831,7 @@ async function monitorAndEvaluate() {
     const claimId = Number(claim.id);
     console.log(`\nEvaluating claim #${claimId}: "${claim.name}"`);
 
+    await new Promise(r => setTimeout(r, 1000));
     const imageUrl = await resolveClaimImage(claimId, contract, provider);
     if (!imageUrl) {
       console.log('  Could not resolve image, skipping.');

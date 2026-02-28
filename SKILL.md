@@ -85,3 +85,16 @@ POIDH_CHAIN=base RPC_URL=$BASE_RPC_URL node poidh-cli.js <command> [args]
 - 提交 claim 不需要 ETH（只需 gas）
 - open bounty 有外部贡献者时，接受 claim 需要走投票流程（2天）
 - 链接：https://poidh.xyz
+
+## 已知限制（待改进）
+
+- **单 bounty 限制**：bot-state.json 同时只跟踪一个 bounty，创建新 bounty 时旧的需先完成或过期。计划改为数组支持多 bounty 并发。
+- **选胜者权限**：只有 bounty 创建者（authorFid）能触发 pick winner 和全量评分。
+- **评分省 token**：查 claim 数量/进展不看图；查具体某个 claim 才看一张图；选胜者时才全量看图评分。
+
+## 2026-03-01 修复记录
+
+- **图片解析 bug**：`resolveClaimImage` 里 `res.data` 改为 `await res.text()`（Node fetch 没有 .data 属性）
+- **RPC 限流优化**：缓存 `poidhNft()` 返回值 + claim 间 1 秒 delay
+- **状态文件路径**：迁移到 `runtime/` 目录，自动迁移旧文件
+- **权限控制**：pick winner 和 scoring 只限 bounty 创建者（authorFid 匹配）

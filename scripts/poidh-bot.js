@@ -10,16 +10,19 @@ const CHAINS = {
     contract: '0x5555Fa783936C260f77385b4E153B9725feF1719',
     url: 'https://poidh.xyz/base',
     idOffset: 986,
+    chainId: 8453,
   },
   arbitrum: {
     contract: '0x5555Fa783936C260f77385b4E153B9725feF1719',
     url: 'https://poidh.xyz/arbitrum',
     idOffset: 0,
+    chainId: 42161,
   },
   degen: {
     contract: '0x18E5585ca7cE31b90Bc8BB7aAf84152857cE243f',
     url: 'https://poidh.xyz/degen',
     idOffset: 0,
+    chainId: 666666666,
   },
 };
 
@@ -120,14 +123,42 @@ function atomicWrite(filePath, data) {
   fs.renameSync(tmp, filePath);
 }
 
+// --- Multi-bounty state management ---
+function loadAllBounties() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    if (Array.isArray(raw?.bounties)) return raw.bounties;
+    // Migrate old single-bounty format
+    if (raw && raw.bountyId !== undefined) return [raw];
+    return [];
+  } catch { return []; }
+}
+
+function saveAllBounties(bounties) {
+  atomicWrite(STATE_FILE, JSON.stringify({ bounties }, null, 2));
+  updateSummaryAll(bounties);
+}
+
+function findBounty(bountyId) {
+  return loadAllBounties().find(b => b.bountyId === bountyId) || null;
+}
+
+function saveBounty(bounty) {
+  const all = loadAllBounties();
+  const idx = all.findIndex(b => b.bountyId === bounty.bountyId);
+  if (idx >= 0) all[idx] = bounty;
+  else all.push(bounty);
+  saveAllBounties(all);
+}
+
+// Compat wrappers (used by single-bounty commands like create)
 function loadState() {
-  try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); }
-  catch { return null; }
+  const all = loadAllBounties();
+  return all.find(b => b.phase === 'monitoring') || all[0] || null;
 }
 
 function saveState(state) {
-  atomicWrite(STATE_FILE, JSON.stringify(state, null, 2));
-  updateSummary(state);
+  saveBounty(state);
 }
 
 function appendLog(entry) {
@@ -140,41 +171,38 @@ function appendLog(entry) {
 }
 
 // --- Export readable summary for external systems (e.g. Farcaster webhook/Gemini) ---
-const SUMMARY_FILE = path.join(__dirname, 'bot-summary.txt');
+const SUMMARY_FILE = path.join(RUNTIME_DIR, 'bot-summary.txt');
 
-function updateSummary(state) {
-  if (!state) { state = loadState(); }
-  if (!state) {
+function updateSummaryAll(bounties) {
+  if (!bounties || bounties.length === 0) {
     try { fs.unlinkSync(SUMMARY_FILE); } catch {}
     return;
   }
-
-  const stateChain = CHAINS[state.chain || CHAIN_NAME] || CHAIN;
-  const webId = state.bountyId + stateChain.idOffset;
-  let summary = `POIDH BOT STATUS\n`;
-  summary += `Phase: ${state.phase}\n`;
-  summary += `Bounty: "${state.bountyName}" (#${state.bountyId}, web: ${webId})\n`;
-  summary += `URL: ${stateChain.url}/bounty/${webId}\n`;
-  summary += `Amount: ${state.amount} ETH\n`;
-  summary += `Created: ${state.createdAt}\n`;
-  summary += `Claims evaluated: ${state.evaluatedClaims.length}\n\n`;
-
-  if (state.evaluatedClaims.length > 0) {
-    const sorted = [...state.evaluatedClaims].sort((a, b) => b.score - a.score || a.id - b.id);
-    summary += `EVALUATIONS (ranked):\n`;
-    sorted.forEach((c, i) => {
-      summary += `${i + 1}. Claim #${c.id} — ${c.score}/30 (r:${c.relevance} q:${c.quality} a:${c.authenticity}) — ${c.reasoning}\n`;
-    });
+  let summary = `POIDH BOT STATUS — ${bounties.length} bounty(ies)\n\n`;
+  for (const state of bounties) {
+    const stateChain = CHAINS[state.chain || CHAIN_NAME] || CHAIN;
+    const webId = state.bountyId + stateChain.idOffset;
+    summary += `--- Bounty #${state.bountyId} (web: ${webId}) ---\n`;
+    summary += `Phase: ${state.phase}\n`;
+    summary += `Name: "${state.bountyName}"\n`;
+    summary += `URL: ${stateChain.url}/bounty/${webId}\n`;
+    summary += `Amount: ${state.amount} ETH\n`;
+    summary += `Created: ${state.createdAt}\n`;
+    summary += `Claims evaluated: ${(state.evaluatedClaims || []).length}\n`;
+    if (state.evaluatedClaims && state.evaluatedClaims.length > 0) {
+      const sorted = [...state.evaluatedClaims].sort((a, b) => b.score - a.score || a.id - b.id);
+      summary += `Top claims: ${sorted.slice(0, 3).map((c, i) => `#${c.id} ${c.score}/30`).join(', ')}\n`;
+    }
+    if (state.winner) {
+      summary += `WINNER: Claim #${state.winner.id} — ${state.winner.score}/30\n`;
+    }
     summary += '\n';
   }
-
-  if (state.winner) {
-    summary += `WINNER: Claim #${state.winner.id} — ${state.winner.score}/30\n`;
-    summary += `Reason: ${state.winner.reasoning}\n`;
-    summary += `TX: ${state.acceptTxHash || state.voteTxHash || 'pending'}\n`;
-  }
-
   fs.writeFileSync(SUMMARY_FILE, summary);
+}
+
+function updateSummary(state) {
+  updateSummaryAll(loadAllBounties());
 }
 
 // --- Pending bounty requests ---
@@ -338,26 +366,7 @@ async function checkPendingFunds() {
     snapshots[chain] = { balance: currentBalance, timestamp: new Date().toISOString() };
     saveBalanceSnapshot(snapshots);
 
-    // Check if another bounty is already active
-    const state = loadState();
-    if (state && state.phase === 'monitoring') {
-      const elapsedH = (Date.now() - new Date(state.createdAt).getTime()) / (1000 * 60 * 60);
-      const bestScore = state.evaluatedClaims.length > 0
-        ? Math.max(...state.evaluatedClaims.map(c => c.score))
-        : 0;
-
-      // Auto-expire old bounty if: >24h and no good claims (best < 15), or >48h regardless
-      if (elapsedH > 48 || (elapsedH > 24 && bestScore < 15)) {
-        console.log(`Auto-expiring bounty #${state.bountyId} (${elapsedH.toFixed(1)}h, best score ${bestScore}/30) to make room for new bounty`);
-        state.phase = 'expired';
-        saveState(state);
-        appendLog({ event: 'bounty_auto_expired', bountyId: state.bountyId, reason: `${elapsedH.toFixed(1)}h, best ${bestScore}/30, new pending` });
-      } else {
-        console.log(`Another bounty is active (#${state.bountyId}, ${elapsedH.toFixed(1)}h, best ${bestScore}/30). Will retry later.`);
-        continue;
-      }
-    }
-
+    // Multi-bounty: no need to expire old ones, just create new
     // Try to create the bounty
     let newState = null;
     try {
@@ -388,8 +397,8 @@ async function checkPendingFunds() {
         try {
           const bountyChain = CHAINS[chain] || CHAINS.base;
           const webId = newState.bountyId + bountyChain.idOffset;
-          const notifyText = `your bounty is live! "${matched.name}" — ${matched.amount} ${token} on ${chain}\n\n${bountyChain.url}/bounty/${webId}`;
-          replyToFarcaster(matched.castHash, matched.authorFid, notifyText);
+          const notifyText = `your bounty is live! "${matched.name}" — ${matched.amount} ${token} on ${chain}`;
+          replyToFarcaster(matched.castHash, matched.authorFid, notifyText, [{ url: `${bountyChain.url}/bounty/${webId}` }]);
           console.log(`Notified @${matched.requestedBy} via reply to ${matched.castHash}`);
         } catch (e) {
           console.error(`Failed to notify @${matched.requestedBy}: ${e.message}`);
@@ -429,7 +438,11 @@ function fetch(url, timeoutMs = 30000, _redirects = 0) {
       }
       let data = '';
       res.on('data', c => data += c);
-      res.on('end', () => resolve({ status: res.statusCode, data }));
+      res.on('end', () => resolve({ 
+        status: res.statusCode, 
+        data,
+        text: async () => data // Droid 修复：兼容 .text() 调用
+      }));
     });
     req.on('error', reject);
     req.on('timeout', () => { req.destroy(); reject(new Error(`Fetch timeout after ${timeoutMs}ms: ${url}`)); });
@@ -479,9 +492,9 @@ function postJSON(url, body, headers = {}, timeoutMs = 30000) {
 }
 
 // --- Gemini Vision Evaluation ---
-async function evaluateWithGemini(imageUrl, bountyName, bountyDesc, claimName, claimDesc) {
-  const apiKey = process.env.GOOGLE_API_KEY;
-  if (!apiKey) throw new Error('GOOGLE_API_KEY not set');
+async function evaluateWithVision(imageUrl, bountyName, bountyDesc, claimName, claimDesc) {
+  const apiKey = process.env.NOVAI_API_KEY || 'sk-mjvKE95OXW8VVBEqkAMjaWy0LzOJeA5g6DBzcHK86N2kvZer';
+  if (!apiKey) throw new Error('NOVAI_API_KEY not set');
 
   let imageData, mimeType;
   try {
@@ -530,34 +543,113 @@ Respond in this exact JSON format only, no other text:
 The "total" should be the sum of the three scores (max 30).`;
 
   const body = {
-    contents: [{
-      parts: [
-        { text: prompt },
-        { inline_data: { mime_type: mimeType, data: imageData } }
+    model: 'gemini-3-flash-preview',
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'image_url', image_url: { url: `data:${mimeType};base64,${imageData}` } },
+        { type: 'text', text: prompt },
       ]
-    }]
+    }],
+    max_tokens: 1024,
   };
 
   const res = await postJSON(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`,
+    'https://twob.pp.ua/v1/chat/completions',
     body,
-    {},
+    { 'Authorization': `Bearer ${apiKey}` },
     60000
   );
 
   try {
     const parsed = JSON.parse(res.data);
-    if (!parsed.candidates || !parsed.candidates[0]?.content?.parts?.[0]?.text) {
-      const reason = parsed.error?.message || parsed.promptFeedback?.blockReason || 'no candidates';
-      return { total: 0, relevance: 0, quality: 0, authenticity: 0, reasoning: `Gemini blocked: ${reason}` };
+    if (!parsed.choices || !parsed.choices[0]?.message?.content) {
+      const reason = parsed.error?.message || 'no choices';
+      return { total: 0, relevance: 0, quality: 0, authenticity: 0, reasoning: `LLM blocked: ${reason}` };
     }
-    const text = parsed.candidates[0].content.parts[0].text;
+    const text = parsed.choices[0].message.content;
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     if (jsonMatch) return JSON.parse(jsonMatch[0]);
   } catch (e) {
-    return { total: 0, relevance: 0, quality: 0, authenticity: 0, reasoning: `Gemini parse error: ${e.message}` };
+    return { total: 0, relevance: 0, quality: 0, authenticity: 0, reasoning: `LLM parse error: ${e.message}` };
   }
-  return { total: 0, relevance: 0, quality: 0, authenticity: 0, reasoning: 'Gemini returned unexpected format' };
+  return { total: 0, relevance: 0, quality: 0, authenticity: 0, reasoning: 'LLM returned unexpected format' };
+}
+
+// --- Fetch claims via poidh tRPC API (bypasses contract pagination bug) ---
+async function fetchClaimsFromWeb(webBountyId, chainId) {
+  try {
+    const input = { "0": { "json": { "bountyId": webBountyId, "chainId": chainId, "limit": 100, "cursor": null, "direction": "forward" } } };
+    const url = `https://poidh.xyz/api/trpc/claims.fetchBountyClaims?batch=1&input=${encodeURIComponent(JSON.stringify(input))}`;
+    const res = await fetch(url);
+    const data = JSON.parse(res.data);
+    const items = data[0]?.result?.data?.json?.items;
+    if (!Array.isArray(items)) return null;
+    return items.map(c => ({
+      id: c.id,
+      onChainId: c.onChainId,
+      issuer: c.issuer,
+      name: c.title || '',
+      description: c.description || '',
+      imageUrl: c.url || null,
+      accepted: c.isAccepted || false,
+    }));
+  } catch (e) {
+    console.error('fetchClaimsFromWeb error:', e.message);
+    return null;
+  }
+}
+
+// --- Auto-sync bounties from poidh (discover all active bounties for our wallet) ---
+const WALLET_ADDRESS = process.env.POIDH_WALLET || '0xF9028f6269E84ADbB6a418C0dFB77d766C263Ddd';
+
+async function syncBountiesFromChain() {
+  const CHAINID_TO_NAME = {};
+  for (const [name, cfg] of Object.entries(CHAINS)) CHAINID_TO_NAME[cfg.chainId] = name;
+
+  let added = 0;
+  const seen = new Set();
+  for (const [chainName, chain] of Object.entries(CHAINS)) {
+    try {
+      const input = { "0": { "json": { "address": WALLET_ADDRESS, "chainId": chain.chainId, "limit": 50, "cursor": null } } };
+      const url = `https://poidh.xyz/api/trpc/accounts.bounties?batch=1&input=${encodeURIComponent(JSON.stringify(input))}`;
+      const res = await fetch(url);
+      const data = JSON.parse(res.data);
+      const items = data[0]?.result?.data?.json?.items;
+      if (!Array.isArray(items)) continue;
+
+      const currentBounties = loadAllBounties();
+      for (const b of items) {
+        if (b.claimer && b.claimer !== '0x0000000000000000000000000000000000000000') continue;
+        // Use the bounty's actual chainId to determine the real chain
+        const realChain = CHAINID_TO_NAME[b.chainId] || chainName;
+        const contractId = b.onChainId;
+        const key = `${realChain}:${contractId}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        if (currentBounties.find(cb => cb.bountyId === contractId && cb.chain === realChain)) continue;
+        const amountETH = (Number(b.amount) / 1e18).toFixed(4);
+        currentBounties.push({
+          bountyId: contractId,
+          bountyName: (b.title || '').trim(),
+          bountyDesc: (b.description || b.title || '').trim(),
+          chain: realChain,
+          phase: 'monitoring',
+          amount: amountETH,
+          authorFid: 275646,
+          createdAt: new Date().toISOString(),
+          evaluatedClaims: [],
+          winner: null, castHash: null, txHash: null, acceptTxHash: null, farcasterPostHash: null,
+        });
+        saveAllBounties(currentBounties);
+        console.log(`Auto-discovered bounty #${contractId} "${(b.title||'').trim()}" on ${realChain}`);
+        added++;
+      }
+    } catch (e) {
+      console.error(`syncBounties ${chainName}: ${e.message}`);
+    }
+  }
+  if (added > 0) console.log(`Synced ${added} new bounty(ies) from chain.`);
 }
 
 // --- Resolve claim image URL ---
@@ -610,7 +702,7 @@ function truncateToBytes(text, maxBytes = 320) {
   return text.slice(0, lo) + '...';
 }
 
-async function postToFarcaster(text, channel = null) {
+async function postToFarcaster(text, channel = null, embeds = []) {
   const apiKey = process.env.NEYNAR_API_KEY;
   const signerUuid = process.env.NEYNAR_SIGNER_UUID;
   if (!apiKey || !signerUuid) {
@@ -621,6 +713,7 @@ async function postToFarcaster(text, channel = null) {
   const truncated = truncateToBytes(text);
   const body = { signer_uuid: signerUuid, text: truncated };
   if (channel) body.channel_id = channel;
+  if (embeds.length > 0) body.embeds = embeds;
 
   try {
     const res = await postJSON('https://api.neynar.com/v2/farcaster/cast', body, { 'x-api-key': apiKey });
@@ -639,7 +732,7 @@ async function postToFarcaster(text, channel = null) {
   }
 }
 
-async function replyToFarcaster(parentHash, parentFid, text) {
+async function replyToFarcaster(parentHash, parentFid, text, embeds = []) {
   const apiKey = process.env.NEYNAR_API_KEY;
   const signerUuid = process.env.NEYNAR_SIGNER_UUID;
   if (!apiKey || !signerUuid) {
@@ -649,6 +742,7 @@ async function replyToFarcaster(parentHash, parentFid, text) {
 
   const truncated = truncateToBytes(text);
   const body = { signer_uuid: signerUuid, text: truncated, parent: parentHash, parent_author_fid: Number(parentFid) };
+  if (embeds.length > 0) body.embeds = embeds;
 
   try {
     const res = await postJSON('https://api.neynar.com/v2/farcaster/cast', body, { 'x-api-key': apiKey });
@@ -757,8 +851,9 @@ async function createBounty(opts = {}) {
     const chainLabel = chainName.charAt(0).toUpperCase() + chainName.slice(1);
     const typeLabel = type === 'open' ? 'open bounty (anyone can add funds)' : 'bounty';
     const token = chainName === 'degen' ? 'DEGEN' : 'ETH';
-    const postText = `new ${typeLabel} on poidh: "${name}" — ${amount} ${token} on ${chainLabel}\n\n${chain.url}/bounty/${webId}`;
-    await postToFarcaster(postText, 'poidh');
+    const bountyUrl = `${chain.url}/bounty/${webId}`;
+    const postText = `new ${typeLabel} on poidh: "${name}" — ${amount} ${token} on ${chainLabel}`;
+    await postToFarcaster(postText, 'poidh', [{ url: bountyUrl }]);
     console.log('Announced on Farcaster.');
     appendLog({ event: 'farcaster_announce', bountyId, webId });
   } catch (e) {
@@ -783,12 +878,22 @@ function getWalletForState(state) {
 }
 
 // Phase 2: Monitor and evaluate claims
-async function monitorAndEvaluate() {
-  const state = loadState();
-  if (!state || state.phase !== 'monitoring') {
+async function monitorAndEvaluate(targetBountyId) {
+  const allBounties = loadAllBounties();
+  const monitoring = targetBountyId
+    ? allBounties.filter(b => b.bountyId === targetBountyId && b.phase === 'monitoring')
+    : allBounties.filter(b => b.phase === 'monitoring');
+  if (monitoring.length === 0) {
     console.log('No active bounty in monitoring phase.');
     return;
   }
+  for (const state of monitoring) {
+    console.log(`\n=== Monitoring bounty #${state.bountyId}: "${state.bountyName}" ===`);
+    await monitorSingleBounty(state);
+  }
+}
+
+async function monitorSingleBounty(state) {
 
   const { wallet, provider, contract, chain: stateChain } = getWalletForState(state);
 
@@ -801,24 +906,16 @@ async function monitorAndEvaluate() {
     return;
   }
 
-  // Fetch all claims (paginate in batches of 10, contract reverts when offset exceeds)
-  let allFetchedClaims = [];
-  let offset = 0;
-  while (true) {
-    let batch;
-    try {
-      batch = await contract.getClaimsByBountyId(state.bountyId, offset);
-    } catch {
-      break; // contract reverts when offset exceeds total claims
-    }
-    if (batch.length === 0) break;
-    allFetchedClaims = allFetchedClaims.concat(batch);
-    if (batch.length < 10) break;
-    offset += 10;
+  // Fetch all claims via poidh tRPC API (bypasses contract pagination bug)
+  const webBountyId = state.bountyId + stateChain.idOffset;
+  const webClaims = await fetchClaimsFromWeb(webBountyId, stateChain.chainId);
+  if (!webClaims) {
+    console.log('Failed to fetch claims from poidh API.');
+    return;
   }
 
-  const newClaims = allFetchedClaims.filter(c =>
-    c.issuer !== ethers.ZeroAddress && !c.accepted && !state.evaluatedClaims.find(ec => ec.id === Number(c.id))
+  const newClaims = webClaims.filter(c =>
+    !c.accepted && !state.evaluatedClaims.find(ec => ec.id === c.id)
   );
   if (newClaims.length === 0) {
     console.log(`No new claims. Total evaluated: ${state.evaluatedClaims.length}`);
@@ -828,11 +925,10 @@ async function monitorAndEvaluate() {
   console.log(`Found ${newClaims.length} new claim(s). Evaluating...`);
 
   for (const claim of newClaims) {
-    const claimId = Number(claim.id);
+    const claimId = claim.id;
     console.log(`\nEvaluating claim #${claimId}: "${claim.name}"`);
 
-    await new Promise(r => setTimeout(r, 1000));
-    const imageUrl = await resolveClaimImage(claimId, contract, provider);
+    const imageUrl = claim.imageUrl || await resolveClaimImage(claim.onChainId || claimId, contract, provider);
     if (!imageUrl) {
       console.log('  Could not resolve image, skipping.');
       state.evaluatedClaims.push({ id: claimId, issuer: claim.issuer, name: claim.name, description: claim.description, score: 0, relevance: 0, quality: 0, authenticity: 0, reasoning: 'Could not resolve image' });
@@ -840,7 +936,7 @@ async function monitorAndEvaluate() {
     }
 
     console.log(`  Image: ${imageUrl}`);
-    const evaluation = await evaluateWithGemini(imageUrl, state.bountyName, state.bountyDesc, claim.name, claim.description);
+    const evaluation = await evaluateWithVision(imageUrl, state.bountyName, state.bountyDesc, claim.name, claim.description);
     console.log(`  Score: ${evaluation.total || 0}/30 — ${evaluation.reasoning}`);
 
     state.evaluatedClaims.push({
@@ -861,8 +957,9 @@ async function monitorAndEvaluate() {
     // Post evaluation publicly on Farcaster
     try {
       const webId = state.bountyId + stateChain.idOffset;
-      const evalPost = `evaluated claim #${claimId} on bounty "${state.bountyName}"\n\nrelevance: ${evaluation.relevance || 0}/10\nquality: ${evaluation.quality || 0}/10\nauthenticity: ${evaluation.authenticity || 0}/10\ntotal: ${evaluation.total || 0}/30\n\n${evaluation.reasoning || 'No reasoning'}\n\n${stateChain.url}/bounty/${webId}`;
-      await postToFarcaster(evalPost);
+      const bountyUrl = `${stateChain.url}/bounty/${webId}`;
+      const evalPost = `evaluated claim #${claimId} on bounty "${state.bountyName}"\n\nrelevance: ${evaluation.relevance || 0}/10\nquality: ${evaluation.quality || 0}/10\nauthenticity: ${evaluation.authenticity || 0}/10\ntotal: ${evaluation.total || 0}/30\n\n${evaluation.reasoning || 'No reasoning'}`;
+      await postToFarcaster(evalPost, 'poidh', [{ url: bountyUrl }]);
       console.log(`  Posted evaluation on Farcaster.`);
     } catch (e) {
       console.error(`  Farcaster eval post failed: ${e.message}`);
@@ -874,8 +971,8 @@ async function monitorAndEvaluate() {
 }
 
 // Phase 3: Select winner and accept
-async function selectAndAccept(minWaitHours = 24) {
-  const state = loadState();
+async function selectAndAccept(minWaitHours = 24, providedState = null) {
+  const state = providedState || loadState();
   if (!state || state.phase !== 'monitoring') {
     console.log('No active bounty in monitoring phase.');
     return;
@@ -900,7 +997,7 @@ async function selectAndAccept(minWaitHours = 24) {
       appendLog({ event: 'bounty_expired', bountyId: state.bountyId, reason: 'no claims after 7 days' });
       try {
         const webId = state.bountyId + stateChain.idOffset;
-        await postToFarcaster(`bounty "${state.bountyName}" expired — no valid claims after 7 days\n\n${stateChain.url}/bounty/${webId}`);
+        await postToFarcaster(`bounty "${state.bountyName}" expired — no valid claims after 7 days`, 'poidh', [{ url: `${stateChain.url}/bounty/${webId}` }]);
       } catch (e) { /* ignore */ }
     } else {
       console.log('No claims to evaluate.');
@@ -908,23 +1005,24 @@ async function selectAndAccept(minWaitHours = 24) {
     return;
   }
 
-  // Gemini health check: verify API is working before making settlement decisions
-  const apiKey = process.env.GOOGLE_API_KEY;
-  if (apiKey) {
+  // LLM health check: verify API is working before making settlement decisions
+  const llmKey = process.env.NOVAI_API_KEY;
+  if (llmKey) {
     try {
       const testRes = await postJSON(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`,
-        { contents: [{ parts: [{ text: 'reply with "ok"' }] }] }
+        'https://twob.pp.ua/v1/chat/completions',
+        { model: 'gemini-3-flash-preview', messages: [{ role: 'user', content: 'reply with "ok"' }], max_tokens: 10 },
+        { 'Authorization': `Bearer ${llmKey}` }
       );
       const testData = JSON.parse(testRes.data);
-      if (!testData.candidates || testData.candidates.length === 0) {
-        console.log('Gemini API not healthy (no candidates). Skipping settlement to prevent errors.');
-        appendLog({ event: 'settlement_skipped', reason: 'Gemini API unhealthy' });
+      if (!testData.choices || testData.choices.length === 0) {
+        console.log('LLM API not healthy (no choices). Skipping settlement to prevent errors.');
+        appendLog({ event: 'settlement_skipped', reason: 'LLM API unhealthy' });
         return;
       }
     } catch (e) {
-      console.log(`Gemini API check failed: ${e.message}. Skipping settlement.`);
-      appendLog({ event: 'settlement_skipped', reason: `Gemini check failed: ${e.message}` });
+      console.log(`LLM API check failed: ${e.message}. Skipping settlement.`);
+      appendLog({ event: 'settlement_skipped', reason: `LLM check failed: ${e.message}` });
       return;
     }
   }
@@ -936,7 +1034,7 @@ async function selectAndAccept(minWaitHours = 24) {
     console.log(`Re-evaluating previously failed claim #${fc.id}...`);
     const imageUrl = await resolveClaimImage(fc.id, contract, provider);
     if (!imageUrl) continue;
-    const evaluation = await evaluateWithGemini(imageUrl, state.bountyName, state.bountyDesc, fc.name, fc.description);
+    const evaluation = await evaluateWithVision(imageUrl, state.bountyName, state.bountyDesc, fc.name, fc.description);
     if (evaluation.total > 0) {
       Object.assign(fc, {
         score: evaluation.total,
@@ -977,9 +1075,7 @@ async function selectAndAccept(minWaitHours = 24) {
     if (allClaims.length > 1) {
       ranking += `\nweakest: claim #${allClaims[allClaims.length - 1].id} — ${allClaims[allClaims.length - 1].reasoning}`;
     }
-    ranking += `\n\n${stateChain.url}/bounty/${webId}`;
-
-    await postToFarcaster(ranking);
+    await postToFarcaster(ranking, 'poidh', [{ url: `${stateChain.url}/bounty/${webId}` }]);
     console.log('Posted full ranking on Farcaster.');
     appendLog({ event: 'farcaster_ranking', bountyId: state.bountyId });
   } catch (e) {
@@ -1015,8 +1111,8 @@ async function selectAndAccept(minWaitHours = 24) {
 
     try {
       const webId = state.bountyId + stateChain.idOffset;
-      const votePost = `submitted claim #${winner.id} for vote on bounty "${state.bountyName}" — score ${winner.score}/30\n\ncontributors have 2 days to vote\n\n${winner.reasoning}\n\n${stateChain.url}/bounty/${webId}`;
-      await postToFarcaster(votePost);
+      const votePost = `submitted claim #${winner.id} for vote on bounty "${state.bountyName}" — score ${winner.score}/30\n\ncontributors have 2 days to vote\n\n${winner.reasoning}`;
+      await postToFarcaster(votePost, 'poidh', [{ url: `${stateChain.url}/bounty/${webId}` }]);
     } catch (e) {
       console.error('Farcaster vote post failed:', e.message);
     }
@@ -1036,8 +1132,8 @@ async function selectAndAccept(minWaitHours = 24) {
 
     try {
       const webId = state.bountyId + stateChain.idOffset;
-      const explanation = `accepted claim #${winner.id} on my poidh bounty "${state.bountyName}" — score ${winner.score}/30\n\n${winner.reasoning}\n\n${stateChain.url}/bounty/${webId}`;
-      await postToFarcaster(explanation);
+      const explanation = `accepted claim #${winner.id} on my poidh bounty "${state.bountyName}" — score ${winner.score}/30\n\n${winner.reasoning}`;
+      await postToFarcaster(explanation, 'poidh', [{ url: `${stateChain.url}/bounty/${webId}` }]);
       appendLog({ event: 'farcaster_explanation', bountyId: state.bountyId });
     } catch (e) {
       console.error('Farcaster post failed:', e.message);
@@ -1049,7 +1145,8 @@ async function selectAndAccept(minWaitHours = 24) {
     try {
       const webId = state.bountyId + stateChain.idOffset;
       await replyToFarcaster(state.castHash, state.authorFid,
-        `winner picked for your bounty "${state.bountyName}"! claim #${winner.id} — score ${winner.score}/30\n\n${stateChain.url}/bounty/${webId}`);
+        `winner picked for your bounty "${state.bountyName}"! claim #${winner.id} — score ${winner.score}/30`,
+        [{ url: `${stateChain.url}/bounty/${webId}` }]);
     } catch (e) { /* ignore */ }
   }
 
@@ -1057,8 +1154,8 @@ async function selectAndAccept(minWaitHours = 24) {
 }
 
 // Accept a specific claim by ID (user-directed)
-async function acceptSpecificClaim(claimId) {
-  const state = loadState();
+async function acceptSpecificClaim(claimId, targetBountyId = null) {
+  const state = targetBountyId ? findBounty(targetBountyId) : loadState();
   if (!state || state.phase !== 'monitoring') {
     console.log('No active bounty in monitoring phase.');
     return;
@@ -1107,7 +1204,7 @@ async function acceptSpecificClaim(claimId) {
     saveState(state);
     appendLog({ event: 'vote_submitted_user', claimId, txHash: tx.hash });
     try {
-      await postToFarcaster(`submitted claim #${claimId} for vote on bounty "${state.bountyName}" (user-selected)\n\ncontributors have 2 days to vote\n\n${stateChain.url}/bounty/${webId}`);
+      await postToFarcaster(`submitted claim #${claimId} for vote on bounty "${state.bountyName}" (user-selected)\n\ncontributors have 2 days to vote`, 'poidh', [{ url: `${stateChain.url}/bounty/${webId}` }]);
     } catch (e) { /* ignore */ }
   } else {
     const tx = await contract.acceptClaim(state.bountyId, claimId);
@@ -1120,7 +1217,7 @@ async function acceptSpecificClaim(claimId) {
     saveState(state);
     appendLog({ event: 'claim_accepted_user', claimId, txHash: tx.hash });
     try {
-      await postToFarcaster(`accepted claim #${claimId} on bounty "${state.bountyName}" (selected by bounty creator)\n\n${stateChain.url}/bounty/${webId}`);
+      await postToFarcaster(`accepted claim #${claimId} on bounty "${state.bountyName}" (selected by bounty creator)`, 'poidh', [{ url: `${stateChain.url}/bounty/${webId}` }]);
     } catch (e) { /* ignore */ }
   }
 
@@ -1128,7 +1225,8 @@ async function acceptSpecificClaim(claimId) {
   if (state.castHash && state.authorFid) {
     try {
       await replyToFarcaster(state.castHash, state.authorFid,
-        `claim #${claimId} has been accepted on your bounty "${state.bountyName}"!\n\n${stateChain.url}/bounty/${webId}`);
+        `claim #${claimId} has been accepted on your bounty "${state.bountyName}"!`,
+        [{ url: `${stateChain.url}/bounty/${webId}` }]);
     } catch (e) { /* ignore */ }
   }
 
@@ -1171,7 +1269,7 @@ async function resolveOpenVote() {
 
     try {
       const webId = state.bountyId + stateChain.idOffset;
-      await postToFarcaster(`vote resolved on bounty "${state.bountyName}" — claim #${state.winner.id} wins!\n\nyes: ${yesWeight}, no: ${noWeight}\n\n${stateChain.url}/bounty/${webId}`);
+      await postToFarcaster(`vote resolved on bounty "${state.bountyName}" — claim #${state.winner.id} wins!\n\nyes: ${yesWeight}, no: ${noWeight}`, 'poidh', [{ url: `${stateChain.url}/bounty/${webId}` }]);
     } catch (e) {
       console.error('Farcaster resolve post failed:', e.message);
     }
@@ -1186,7 +1284,7 @@ async function resolveOpenVote() {
 
     try {
       const webId = state.bountyId + stateChain.idOffset;
-      await postToFarcaster(`vote on bounty "${state.bountyName}" did not pass (yes: ${yesWeight}, no: ${noWeight}). reopening for new submissions.\n\n${stateChain.url}/bounty/${webId}`);
+      await postToFarcaster(`vote on bounty "${state.bountyName}" did not pass (yes: ${yesWeight}, no: ${noWeight}). reopening for new submissions.`, 'poidh', [{ url: `${stateChain.url}/bounty/${webId}` }]);
     } catch (e) {
       console.error('Farcaster vote failed post failed:', e.message);
     }
@@ -1195,27 +1293,30 @@ async function resolveOpenVote() {
 
 // Phase 4: Status check
 async function status() {
-  const state = loadState();
-  if (!state) {
+  const allBounties = loadAllBounties();
+  if (allBounties.length === 0) {
     console.log('No bot state found. Run "start" to create a bounty.');
     return;
   }
-  const stateChain = CHAINS[state.chain || CHAIN_NAME] || CHAIN;
-  const webId = state.bountyId + stateChain.idOffset;
-  console.log(`Phase: ${state.phase}`);
-  console.log(`Chain: ${state.chain || CHAIN_NAME}`);
-  console.log(`Bounty #${state.bountyId} (web: ${webId}): "${state.bountyName}"`);
-  console.log(`Created: ${state.createdAt}`);
-  console.log(`Claims evaluated: ${state.evaluatedClaims.length}`);
-  console.log(`URL: ${stateChain.url}/bounty/${webId}`);
-  if (state.winner) {
-    console.log(`Winner: Claim #${state.winner.id} (score: ${state.winner.score}/30)`);
-    console.log(`Accept TX: ${state.acceptTxHash || state.voteTxHash || 'pending'}`);
+  console.log(`Total bounties: ${allBounties.length}\n`);
+  for (const state of allBounties) {
+    const stateChain = CHAINS[state.chain || CHAIN_NAME] || CHAIN;
+    const webId = state.bountyId + stateChain.idOffset;
+    console.log(`--- Bounty #${state.bountyId} (web: ${webId}) ---`);
+    console.log(`  Phase: ${state.phase}`);
+    console.log(`  Chain: ${state.chain || CHAIN_NAME}`);
+    console.log(`  Name: "${state.bountyName}"`);
+    console.log(`  Created: ${state.createdAt}`);
+    console.log(`  Claims evaluated: ${(state.evaluatedClaims || []).length}`);
+    console.log(`  URL: ${stateChain.url}/bounty/${webId}`);
+    if (state.winner) {
+      console.log(`  Winner: Claim #${state.winner.id} (score: ${state.winner.score}/30)`);
+    }
+    const elapsed = (Date.now() - new Date(state.createdAt).getTime()) / (1000 * 60 * 60);
+    console.log(`  Time elapsed: ${elapsed.toFixed(1)}h`);
+    console.log('');
   }
-  const elapsed = (Date.now() - new Date(state.createdAt).getTime()) / (1000 * 60 * 60);
-  console.log(`Time elapsed: ${elapsed.toFixed(1)}h`);
 
-  // Check recent Farcaster post failures
   try {
     const logs = JSON.parse(fs.readFileSync(LOG_FILE, 'utf8'));
     const recent = logs.slice(-50);
@@ -1260,33 +1361,52 @@ Commands:
     --amount 0.001     ETH amount
     --from "username"  Who requested it
   pending            Show pending bounty requests
+
+All commands that operate on a bounty accept --bounty <id> to target a specific bounty.
+Without --bounty, "monitor" processes ALL active bounties; other commands use the first active one.
 `;
+
+function parseBountyArg(args) {
+  const i = args.indexOf('--bounty');
+  return (i !== -1 && args[i + 1]) ? parseInt(args[i + 1]) : null;
+}
 
 (async () => {
   try {
+    const targetBounty = parseBountyArg(args);
     switch (cmd) {
       case 'start':
         await createBounty(parseStartArgs(args));
         break;
       case 'monitor':
-        await monitorAndEvaluate();
+        await monitorAndEvaluate(targetBounty);
         break;
-      case 'select-winner':
-        await selectAndAccept(0); // No minimum wait — user triggered
+      case 'select-winner': {
+        const state = targetBounty ? findBounty(targetBounty) : loadState();
+        if (!state || state.phase !== 'monitoring') { console.log('No matching bounty in monitoring phase.'); break; }
+        await selectAndAccept(0, state);
         break;
-      case 'accept-claim':
-        if (!args[0]) { console.error('Usage: accept-claim <claim-id>'); process.exit(1); }
-        await acceptSpecificClaim(parseInt(args[0]));
+      }
+      case 'accept-claim': {
+        const claimArg = args.find(a => !a.startsWith('--') && a !== args[args.indexOf('--bounty') + 1]);
+        if (!claimArg) { console.error('Usage: accept-claim <claim-id> [--bounty <bounty-id>]'); process.exit(1); }
+        await acceptSpecificClaim(parseInt(claimArg), targetBounty);
         break;
-      case 'select':
-        await selectAndAccept(parseInt(args[0]) || 24);
+      }
+      case 'select': {
+        const hours = parseInt(args.find(a => !a.startsWith('--') && a !== args[args.indexOf('--bounty') + 1])) || 24;
+        const state = targetBounty ? findBounty(targetBounty) : loadState();
+        if (!state || state.phase !== 'monitoring') { console.log('No matching bounty in monitoring phase.'); break; }
+        await selectAndAccept(hours, state);
         break;
+      }
       case 'status':
         await status();
         break;
       case 'run':
         if (!acquireLock()) break;
         try {
+          await syncBountiesFromChain();
           await checkPendingFunds();
           await resolveOpenVote();
           await monitorAndEvaluate();

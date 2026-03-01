@@ -65,7 +65,7 @@ POIDH_CHAIN=base RPC_URL=$BASE_RPC_URL node poidh-cli.js <command> [args]
 | PRIVATE_KEY | 必填，EOA 钱包私钥 |
 | NEYNAR_API_KEY | Neynar API key（Farcaster 发帖用） |
 | NEYNAR_SIGNER_UUID | Neynar 已授权的 signer UUID |
-| GOOGLE_API_KEY | Gemini API key（AI 评估用） |
+| NOVAI_API_KEY | novai 第三方 Gemini API key（AI 视觉评估用，twob.pp.ua） |
 
 ## 最低金额
 
@@ -88,13 +88,19 @@ POIDH_CHAIN=base RPC_URL=$BASE_RPC_URL node poidh-cli.js <command> [args]
 
 ## 已知限制（待改进）
 
-- **单 bounty 限制**：bot-state.json 同时只跟踪一个 bounty，创建新 bounty 时旧的需先完成或过期。计划改为数组支持多 bounty 并发。
 - **选胜者权限**：只有 bounty 创建者（authorFid）能触发 pick winner 和全量评分。
 - **评分省 token**：查 claim 数量/进展不看图；查具体某个 claim 才看一张图；选胜者时才全量看图评分。
+- **已完结清理**：claimer != 0x0 的 bounty 暂未自动标记 completed。
 
 ## 2026-03-01 修复记录
 
-- **图片解析 bug**：`resolveClaimImage` 里 `res.data` 改为 `await res.text()`（Node fetch 没有 .data 属性）
-- **RPC 限流优化**：缓存 `poidhNft()` 返回值 + claim 间 1 秒 delay
-- **状态文件路径**：迁移到 `runtime/` 目录，自动迁移旧文件
+- **图片解析 bug**：`resolveClaimImage` 里 `res.data` 改为 `await res.text()`
+- **模型切换**：评估模型从 hiapi/gemini → novai/gemini-3-flash-preview
+- **bot-state 路径**：webhook-handler 里 `scripts/bot-state.json` 改为 `runtime/bot-state.json`
 - **权限控制**：pick winner 和 scoring 只限 bounty 创建者（authorFid 匹配）
+- **tRPC 迁移**：claims 获取改用 `claims.fetchBountyClaims` tRPC API，一次拿全部 claims + 图片 URL
+- **多 bounty 并发**：bot-state.json 改为 `{ bounties: [...] }`，支持同时管理多个 bounty
+- **自动发现**：通过 `accounts.bounties` tRPC API 自动同步钱包下所有 active bounties
+- **智能匹配**：webhook 从 mention 文本匹配 bounty（#ID、关键词、名字），歧义时主动询问
+- **Frame embed**：所有 bounty 帖子使用 poidh Frame 卡片（embed）而非纯链接，默认发 /poidh 频道
+- **自动检测**：farcaster-cli.js 和 act.mjs 自动检测文本中的 poidh URL，转为 frame embed + 修正格式

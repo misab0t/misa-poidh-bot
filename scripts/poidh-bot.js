@@ -3,6 +3,9 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const http = require('http');
+const { execFileSync } = require('child_process');
+
+const FC_CLI = path.join(__dirname, '..', '..', 'farcaster-agent', 'scripts', 'src', 'farcaster-cli.js');
 
 // --- Config ---
 const CHAINS = {
@@ -182,19 +185,19 @@ function updateSummaryAll(bounties) {
   for (const state of bounties) {
     const stateChain = CHAINS[state.chain || CHAIN_NAME] || CHAIN;
     const webId = state.bountyId + stateChain.idOffset;
-    summary += `--- Bounty #${state.bountyId} (web: ${webId}) ---\n`;
+    summary += `--- "${state.bountyName}" ---\n`;
     summary += `Phase: ${state.phase}\n`;
-    summary += `Name: "${state.bountyName}"\n`;
     summary += `URL: ${stateChain.url}/bounty/${webId}\n`;
     summary += `Amount: ${state.amount} ETH\n`;
     summary += `Created: ${state.createdAt}\n`;
-    summary += `Claims evaluated: ${(state.evaluatedClaims || []).length}\n`;
+    summary += `Submissions: ${(state.evaluatedClaims || []).length}\n`;
     if (state.evaluatedClaims && state.evaluatedClaims.length > 0) {
       const sorted = [...state.evaluatedClaims].sort((a, b) => b.score - a.score || a.id - b.id);
-      summary += `Top claims: ${sorted.slice(0, 3).map((c, i) => `#${c.id} ${c.score}/30`).join(', ')}\n`;
+      summary += `Top submissions: ${sorted.slice(0, 3).map(c => `${c.username ? `@${c.username}` : `"${(c.name || '').slice(0, 25)}"`} ${c.score}/30`).join(', ')}\n`;
     }
     if (state.winner) {
-      summary += `WINNER: Claim #${state.winner.id} — ${state.winner.score}/30\n`;
+      const w = state.winner;
+      summary += `WINNER: ${w.username ? `@${w.username}` : `"${(w.name || '').slice(0, 25)}"`} — ${w.score}/30\n`;
     }
     summary += '\n';
   }
@@ -538,7 +541,7 @@ Evaluate on these criteria (0-10 each):
    Only score 8-10 if the image clearly looks like a real camera photo.
 
 Respond in this exact JSON format only, no other text:
-{"relevance": N, "quality": N, "authenticity": N, "total": N, "reasoning": "one sentence explanation"}
+{"relevance": N, "quality": N, "authenticity": N, "total": N, "reasoning": "Write 3-4 sentences: (1) what the image shows and how it relates to the bounty, (2) specific quality details you noticed (composition, lighting, resolution), (3) why you believe it is or isn't AI-generated, citing concrete visual evidence."}
 
 The "total" should be the sum of the three scores (max 30).`;
 
@@ -598,6 +601,49 @@ async function fetchClaimsFromWeb(webBountyId, chainId) {
     console.error('fetchClaimsFromWeb error:', e.message);
     return null;
   }
+}
+
+// Format claim display: "@username" or submission title (no IDs exposed to users)
+function claimTag(c) {
+  if (c.name) return `"${c.name.slice(0, 30)}"`;
+  if (c.username) return c.username;
+  return 'anonymous';
+}
+
+function claimTagWinner(c) {
+  if (c.username) return `@${c.username}`;
+  if (c.name) return `"${c.name.slice(0, 30)}"`;
+  return 'anonymous';
+}
+
+// --- Resolve wallet addresses to Farcaster usernames via Neynar ---
+async function resolveUsernames(addresses) {
+  const apiKey = process.env.NEYNAR_API_KEY;
+  if (!apiKey || addresses.length === 0) return {};
+  const unique = [...new Set(addresses.map(a => a.toLowerCase()))];
+  const map = {};
+  for (let i = 0; i < unique.length; i += 350) {
+    const batch = unique.slice(i, i + 350);
+    try {
+      const url = `https://api.neynar.com/v2/farcaster/user/bulk-by-address?addresses=${batch.join(',')}`;
+      const res = await new Promise((resolve, reject) => {
+        https.get(url, { headers: { accept: 'application/json', 'x-api-key': apiKey }, timeout: 10000 }, (r) => {
+          let d = '';
+          r.on('data', c => d += c);
+          r.on('end', () => resolve(d));
+        }).on('error', reject);
+      });
+      const data = JSON.parse(res);
+      for (const [addr, users] of Object.entries(data || {})) {
+        if (Array.isArray(users) && users.length > 0) {
+          map[addr.toLowerCase()] = users[0].username;
+        }
+      }
+    } catch (e) {
+      console.error('resolveUsernames error:', e.message);
+    }
+  }
+  return map;
 }
 
 // --- Auto-sync bounties from poidh (discover all active bounties for our wallet) ---
@@ -703,27 +749,22 @@ function truncateToBytes(text, maxBytes = 320) {
 }
 
 async function postToFarcaster(text, channel = null, embeds = []) {
-  const apiKey = process.env.NEYNAR_API_KEY;
-  const signerUuid = process.env.NEYNAR_SIGNER_UUID;
-  if (!apiKey || !signerUuid) {
-    console.log('NEYNAR_API_KEY or NEYNAR_SIGNER_UUID not set, skipping Farcaster post.');
-    return null;
+  const truncated = truncateToBytes(text);
+  const args = ['cast', truncated];
+  if (channel) { args.push('--channel', channel); }
+  for (const e of embeds) {
+    const url = typeof e === 'string' ? e : e.url;
+    if (url) args.push('--embed', url);
   }
 
-  const truncated = truncateToBytes(text);
-  const body = { signer_uuid: signerUuid, text: truncated };
-  if (channel) body.channel_id = channel;
-  if (embeds.length > 0) body.embeds = embeds;
-
   try {
-    const res = await postJSON('https://api.neynar.com/v2/farcaster/cast', body, { 'x-api-key': apiKey });
-    const data = JSON.parse(res.data);
-    if (data.success && data.cast) {
-      appendLog({ event: 'farcaster_post_ok', hash: data.cast.hash });
-      return data.cast.hash;
+    const out = execFileSync('node', [FC_CLI, ...args], { timeout: 30000, encoding: 'utf-8' });
+    const m = out.match(/Cast hash:\s*(0x[0-9a-f]+)/i);
+    if (m) {
+      appendLog({ event: 'farcaster_post_ok', hash: m[1] });
+      return m[1];
     }
-    console.error('Farcaster post unexpected response:', res.data.slice(0, 200));
-    appendLog({ event: 'farcaster_post_ok', output: res.data.slice(0, 100) });
+    console.error('Farcaster post unexpected output:', out.slice(0, 200));
     return null;
   } catch (e) {
     console.error('Farcaster post failed:', e.message.slice(0, 200));
@@ -733,23 +774,19 @@ async function postToFarcaster(text, channel = null, embeds = []) {
 }
 
 async function replyToFarcaster(parentHash, parentFid, text, embeds = []) {
-  const apiKey = process.env.NEYNAR_API_KEY;
-  const signerUuid = process.env.NEYNAR_SIGNER_UUID;
-  if (!apiKey || !signerUuid) {
-    console.log('NEYNAR_API_KEY or NEYNAR_SIGNER_UUID not set, skipping Farcaster reply.');
-    return null;
+  const truncated = truncateToBytes(text);
+  const args = ['reply', parentHash, String(parentFid), truncated];
+  for (const e of embeds) {
+    const url = typeof e === 'string' ? e : e.url;
+    if (url) args.push('--embed', url);
   }
 
-  const truncated = truncateToBytes(text);
-  const body = { signer_uuid: signerUuid, text: truncated, parent: parentHash, parent_author_fid: Number(parentFid) };
-  if (embeds.length > 0) body.embeds = embeds;
-
   try {
-    const res = await postJSON('https://api.neynar.com/v2/farcaster/cast', body, { 'x-api-key': apiKey });
-    const data = JSON.parse(res.data);
-    if (data.success && data.cast) {
-      appendLog({ event: 'farcaster_reply_ok', parentHash, hash: data.cast.hash });
-      return data.cast.hash;
+    const out = execFileSync('node', [FC_CLI, ...args], { timeout: 30000, encoding: 'utf-8' });
+    const m = out.match(/Reply hash:\s*(0x[0-9a-f]+)/i);
+    if (m) {
+      appendLog({ event: 'farcaster_reply_ok', parentHash, hash: m[1] });
+      return m[1];
     }
     return null;
   } catch (e) {
@@ -878,7 +915,7 @@ function getWalletForState(state) {
 }
 
 // Phase 2: Monitor and evaluate claims
-async function monitorAndEvaluate(targetBountyId) {
+async function monitorAndEvaluate(targetBountyId, replyToHash, replyToFid) {
   const allBounties = loadAllBounties();
   const monitoring = targetBountyId
     ? allBounties.filter(b => b.bountyId === targetBountyId && b.phase === 'monitoring')
@@ -889,11 +926,11 @@ async function monitorAndEvaluate(targetBountyId) {
   }
   for (const state of monitoring) {
     console.log(`\n=== Monitoring bounty #${state.bountyId}: "${state.bountyName}" ===`);
-    await monitorSingleBounty(state);
+    await monitorSingleBounty(state, replyToHash, replyToFid);
   }
 }
 
-async function monitorSingleBounty(state) {
+async function monitorSingleBounty(state, replyToHash, replyToFid) {
 
   const { wallet, provider, contract, chain: stateChain } = getWalletForState(state);
 
@@ -919,6 +956,82 @@ async function monitorSingleBounty(state) {
   );
   if (newClaims.length === 0) {
     console.log(`No new claims. Total evaluated: ${state.evaluatedClaims.length}`);
+    // Still post the current leaderboard even if no new claims (e.g. paid re-score)
+    if (state.evaluatedClaims.length > 0) {
+      // Resolve missing usernames before posting
+      const missingAddr = state.evaluatedClaims.filter(c => !c.username && c.issuer).map(c => c.issuer);
+      if (missingAddr.length > 0) {
+        const umap = await resolveUsernames(missingAddr);
+        for (const c of state.evaluatedClaims) {
+          if (!c.username && c.issuer && umap[c.issuer.toLowerCase()]) {
+            c.username = umap[c.issuer.toLowerCase()];
+          }
+        }
+        saveState(state);
+      }
+      const webIdR = state.bountyId + stateChain.idOffset;
+      const bountyUrlR = `${stateChain.url}/bounty/${webIdR}`;
+      const sortedR = [...state.evaluatedClaims].sort((a, b) => b.score - a.score || a.id - b.id);
+      const top5R = sortedR.slice(0, 5);
+      const restR = sortedR.slice(5);
+
+      const topR = sortedR[0];
+      const fullReasonR = (topR.reasoning || '');
+      const briefReasonR = fullReasonR.length <= 120 ? fullReasonR : fullReasonR.slice(0, 120).replace(/\s\S*$/, '') + '...';
+      let summaryR = `📊 "${state.bountyName}" — ${sortedR.length} submissions\n\n`;
+      summaryR += `🏆 ${claimTagWinner(topR)} wins with ${topR.score}/30\n`;
+      if (topR.username && topR.name) summaryR += `"${(topR.name).slice(0, 40)}"\n`;
+      summaryR += `relevance ${topR.relevance} | quality ${topR.quality} | authenticity ${topR.authenticity}\n`;
+      summaryR += `${briefReasonR}\n\nfull ranking 👇`;
+
+      let mainHashR = null;
+      console.log('[re-score] Posting summary to /poidh...');
+      try { mainHashR = await postToFarcaster(summaryR, 'poidh', [{ url: bountyUrlR }]); } catch (e) { console.error('Re-score summary failed:', e.message); }
+      console.log('[re-score] mainHash:', mainHashR);
+
+      if (mainHashR) {
+        // Thread 1: winner full reasoning
+        try {
+          const detail = `🏆 ${claimTagWinner(topR)} — ${topR.score}/30\n\n${topR.reasoning}`;
+          await replyToFarcaster(mainHashR, 2833742, detail);
+        } catch (e) { console.error('Re-score thread 1 failed:', e.message); }
+
+        // Thread 2: full ranking (scores only)
+        try {
+          let rankText = sortedR.slice(0, Math.min(sortedR.length, 10)).map((c, i) => {
+            const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `#${i + 1}`;
+            const isAI = c.score <= 5 && c.authenticity !== undefined && c.authenticity <= 2;
+            return `${medal} ${claimTag(c)}: ${c.score}/30${isAI ? ' ⚠️ AI detected' : ''}`;
+          }).join('\n');
+          if (sortedR.length > 10) rankText += `\n+${sortedR.length - 10} more`;
+          await replyToFarcaster(mainHashR, 2833742, rankText);
+        } catch (e) { console.error('Re-score thread 2 failed:', e.message); }
+
+        // Thread 3: remaining (#11+) if needed
+        try {
+          if (sortedR.length > 10) {
+            let restText = sortedR.slice(10).map((c, i) => {
+              const rank = i + 11;
+              const isAI = c.score <= 5 && c.authenticity !== undefined && c.authenticity <= 2;
+              return `#${rank} ${claimTag(c)}: ${c.score}/30${isAI ? ' ⚠️ AI detected' : ''}`;
+            }).join('\n');
+            await replyToFarcaster(mainHashR, 2833742, restText);
+          }
+        } catch (e) { console.error('Re-score thread 3 failed:', e.message); }
+      }
+
+      // Notify the user who triggered the scoring
+      if (replyToHash && replyToFid && mainHashR) {
+        try {
+          const webIdN = state.bountyId + stateChain.idOffset;
+          const bountyUrlN = `${stateChain.url}/bounty/${webIdN}`;
+          const topWinnerR = sortedR[0];
+          const winnerTagR = topWinnerR.username ? `@${topWinnerR.username}` : `"${(topWinnerR.name || '').slice(0, 30)}"`;
+          await replyToFarcaster(replyToHash, replyToFid, `scores are up for "${state.bountyName}" — ${sortedR.length} claims ranked. ${winnerTagR} is leading with ${topWinnerR.score}/30. want me to settle it? just say "pick winner"`, [{ url: bountyUrlN }]);
+          console.log('Notified trigger user.');
+        } catch (e) { console.error('Trigger notify failed:', e.message); }
+      }
+    }
     return;
   }
 
@@ -953,21 +1066,96 @@ async function monitorSingleBounty(state) {
     });
 
     appendLog({ event: 'claim_evaluated', claimId, score: evaluation.total || 0, reasoning: evaluation.reasoning });
-
-    // Post evaluation publicly on Farcaster
-    try {
-      const webId = state.bountyId + stateChain.idOffset;
-      const bountyUrl = `${stateChain.url}/bounty/${webId}`;
-      const evalPost = `evaluated claim #${claimId} on bounty "${state.bountyName}"\n\nrelevance: ${evaluation.relevance || 0}/10\nquality: ${evaluation.quality || 0}/10\nauthenticity: ${evaluation.authenticity || 0}/10\ntotal: ${evaluation.total || 0}/30\n\n${evaluation.reasoning || 'No reasoning'}`;
-      await postToFarcaster(evalPost, 'poidh', [{ url: bountyUrl }]);
-      console.log(`  Posted evaluation on Farcaster.`);
-    } catch (e) {
-      console.error(`  Farcaster eval post failed: ${e.message}`);
-    }
   }
+
+  // Resolve Farcaster usernames for all claims
+  try {
+    const allAddresses = state.evaluatedClaims.map(c => c.issuer).filter(Boolean);
+    const usernameMap = await resolveUsernames(allAddresses);
+    for (const c of state.evaluatedClaims) {
+      if (c.issuer && !c.username) {
+        c.username = usernameMap[c.issuer.toLowerCase()] || null;
+      }
+    }
+  } catch (e) { console.error('Username resolution failed:', e.message); }
 
   saveState(state);
   console.log(`\nTotal evaluated claims: ${state.evaluatedClaims.length}`);
+
+  // Post a ranked summary after evaluating all new claims
+  if (newClaims.length > 0 && state.evaluatedClaims.length > 0) {
+    const webId = state.bountyId + stateChain.idOffset;
+    const bountyUrl = `${stateChain.url}/bounty/${webId}`;
+    const sorted = [...state.evaluatedClaims].sort((a, b) => b.score - a.score || a.id - b.id);
+    const top5 = sorted.slice(0, 5);
+    const rest = sorted.slice(5);
+
+    // Main post: winner highlight + runners-up
+    const top = sorted[0];
+    const fullReason = (top.reasoning || '');
+    const briefReason = fullReason.length <= 120 ? fullReason : fullReason.slice(0, 120).replace(/\s\S*$/, '') + '...';
+    let summary = `📊 "${state.bountyName}" — ${sorted.length} submissions\n\n`;
+    summary += `🏆 ${claimTagWinner(top)} wins with ${top.score}/30\n`;
+    if (top.username && top.name) summary += `"${(top.name).slice(0, 40)}"\n`;
+    summary += `relevance ${top.relevance} | quality ${top.quality} | authenticity ${top.authenticity}\n`;
+    summary += `${briefReason}\n\nfull ranking 👇`;
+
+    let mainHash = null;
+    try {
+      mainHash = await postToFarcaster(summary, 'poidh', [{ url: bountyUrl }]);
+      console.log('Posted ranked summary on Farcaster.');
+    } catch (e) {
+      console.error('Farcaster ranked summary failed:', e.message);
+    }
+
+    if (mainHash) {
+      // Thread 1: winner full reasoning
+      try {
+        const detail = `🏆 ${claimTagWinner(top)} — ${top.score}/30\n\n${top.reasoning}`;
+        await replyToFarcaster(mainHash, 2833742, detail);
+        console.log('Posted winner detail in thread.');
+      } catch (e) { console.error('Thread 1 failed:', e.message); }
+
+      // Thread 2: full ranking (scores only)
+      try {
+        let rankText = sorted.slice(0, Math.min(sorted.length, 10)).map((c, i) => {
+          const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `#${i + 1}`;
+          const isAI = c.score <= 5 && c.authenticity !== undefined && c.authenticity <= 2;
+          return `${medal} ${claimTag(c)}: ${c.score}/30${isAI ? ' ⚠️ AI detected' : ''}`;
+        }).join('\n');
+        if (sorted.length > 10) rankText += `\n+${sorted.length - 10} more`;
+        await replyToFarcaster(mainHash, 2833742, rankText);
+        console.log('Posted full ranking in thread.');
+      } catch (e) { console.error('Thread 2 failed:', e.message); }
+
+      // Thread 3: remaining (#11+) if needed
+      try {
+        if (sorted.length > 10) {
+          let restText = sorted.slice(10).map((c, i) => {
+            const rank = i + 11;
+            const isAI = c.score <= 5 && c.authenticity !== undefined && c.authenticity <= 2;
+            return `#${rank} ${claimTag(c)}: ${c.score}/30${isAI ? ' ⚠️ AI detected' : ''}`;
+          }).join('\n');
+          await replyToFarcaster(mainHash, 2833742, restText);
+          console.log('Posted remaining rankings in thread.');
+        }
+      } catch (e) { console.error('Thread 3 failed:', e.message); }
+    }
+
+    appendLog({ event: 'farcaster_ranked_summary', bountyId: state.bountyId, claimCount: sorted.length });
+
+    // Notify the user who triggered the scoring
+    if (replyToHash && replyToFid && mainHash) {
+      try {
+        const webId = state.bountyId + stateChain.idOffset;
+        const bountyUrl = `${stateChain.url}/bounty/${webId}`;
+        const topWinner = sorted[0];
+        const winnerTag = topWinner.username ? `@${topWinner.username}` : `"${(topWinner.name || '').slice(0, 30)}"`;
+        await replyToFarcaster(replyToHash, replyToFid, `scores are up for "${state.bountyName}" — ${sorted.length} claims ranked. ${winnerTag} is leading with ${topWinner.score}/30. want me to settle it? just say "pick winner"`, [{ url: bountyUrl }]);
+        console.log('Notified trigger user.');
+      } catch (e) { console.error('Trigger notify failed:', e.message); }
+    }
+  }
 }
 
 // Phase 3: Select winner and accept
@@ -1065,22 +1253,65 @@ async function selectAndAccept(minWaitHours = 24, providedState = null) {
   }
 
   // Post full ranking on Farcaster BEFORE accepting
+  const webId = state.bountyId + stateChain.idOffset;
+  const bountyUrl = `${stateChain.url}/bounty/${webId}`;
+  const top5 = allClaims.slice(0, 5);
+  const rest = allClaims.slice(5);
+
+  const settleTop = allClaims[0];
+  const settleBrief = (settleTop.reasoning || '').split(/\.\s/)[0];
+  let ranking = `🏆 "${state.bountyName}" — settled, ${allClaims.length} submissions\n\n`;
+  ranking += `winner: ${claimTag(settleTop)} with ${settleTop.score}/30\n`;
+  ranking += `"${(settleTop.name || '').slice(0, 40)}"\n`;
+  ranking += `relevance ${settleTop.relevance} | quality ${settleTop.quality} | authenticity ${settleTop.authenticity}\n`;
+  ranking += `${settleBrief}\n\n`;
+  const settleRunners = allClaims.slice(1, 3).filter(c => c.score > 0);
+  settleRunners.forEach(c => {
+    const medal = allClaims.indexOf(c) === 1 ? '🥈' : '🥉';
+    ranking += `${medal} ${claimTag(c)} ${c.score}/30 — "${(c.name || '').slice(0, 30)}"\n`;
+  });
+  ranking += `\nfull ranking 👇`;
+
+  let mainCastHash = null;
   try {
-    const webId = state.bountyId + stateChain.idOffset;
-    let ranking = `final ranking for bounty "${state.bountyName}" (${allClaims.length} submissions)\n\n`;
-    allClaims.forEach((c, i) => {
-      const medal = i === 0 ? '1st' : i === 1 ? '2nd' : i === 2 ? '3rd' : `${i + 1}th`;
-      ranking += `${medal}: claim #${c.id} — ${c.score}/30 (r:${c.relevance} q:${c.quality} a:${c.authenticity})\n`;
-    });
-    if (allClaims.length > 1) {
-      ranking += `\nweakest: claim #${allClaims[allClaims.length - 1].id} — ${allClaims[allClaims.length - 1].reasoning}`;
-    }
-    await postToFarcaster(ranking, 'poidh', [{ url: `${stateChain.url}/bounty/${webId}` }]);
-    console.log('Posted full ranking on Farcaster.');
-    appendLog({ event: 'farcaster_ranking', bountyId: state.bountyId });
+    mainCastHash = await postToFarcaster(ranking, 'poidh', [{ url: bountyUrl }]);
+    console.log('Posted settlement summary.');
   } catch (e) {
     console.error('Farcaster ranking post failed:', e.message);
   }
+
+  if (mainCastHash) {
+    // Thread 1: winner full reasoning
+    try {
+      const detail = `🏆 ${claimTagWinner(settleTop)} — ${settleTop.score}/30\n\n${settleTop.reasoning}`;
+      await replyToFarcaster(mainCastHash, 2833742, detail);
+    } catch (e) { console.error('Settlement thread 1 failed:', e.message); }
+
+    // Thread 2: full ranking (scores only)
+    try {
+      let rankText = allClaims.slice(0, Math.min(allClaims.length, 10)).map((c, i) => {
+        const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `#${i + 1}`;
+        const isAI = c.score <= 5 && c.authenticity !== undefined && c.authenticity <= 2;
+        return `${medal} ${claimTag(c)}: ${c.score}/30${isAI ? ' ⚠️ AI detected' : ''}`;
+      }).join('\n');
+      if (allClaims.length > 10) rankText += `\n+${allClaims.length - 10} more`;
+      await replyToFarcaster(mainCastHash, 2833742, rankText);
+    } catch (e) { console.error('Settlement thread 2 failed:', e.message); }
+
+    // Thread 3: remaining (#11+) if needed
+    try {
+      if (allClaims.length > 10) {
+        let restText = allClaims.slice(10).map((c, i) => {
+          const rank = i + 11;
+          const isAI = c.score <= 5 && c.authenticity !== undefined && c.authenticity <= 2;
+          return `#${rank} ${claimTag(c)}: ${c.score}/30${isAI ? ' ⚠️ AI detected' : ''}`;
+        }).join('\n');
+        await replyToFarcaster(mainCastHash, 2833742, restText);
+      }
+    } catch (e) { console.error('Settlement thread 3 failed:', e.message); }
+  }
+
+  appendLog({ event: 'farcaster_ranking_threaded', bountyId: state.bountyId });
 
   console.log(`\nWinner: Claim #${winner.id} by ${winner.issuer}`);
   console.log(`  Score: ${winner.score}/30`);
@@ -1111,7 +1342,8 @@ async function selectAndAccept(minWaitHours = 24, providedState = null) {
 
     try {
       const webId = state.bountyId + stateChain.idOffset;
-      const votePost = `submitted claim #${winner.id} for vote on bounty "${state.bountyName}" — score ${winner.score}/30\n\ncontributors have 2 days to vote\n\n${winner.reasoning}`;
+      const winnerTag = winner.username ? `@${winner.username}'s` : `"${(winner.name || '').slice(0, 30)}"`;
+      const votePost = `submitted ${winnerTag} submission for vote on "${state.bountyName}" — score ${winner.score}/30\n\ncontributors have 2 days to vote\n\n${winner.reasoning}`;
       await postToFarcaster(votePost, 'poidh', [{ url: `${stateChain.url}/bounty/${webId}` }]);
     } catch (e) {
       console.error('Farcaster vote post failed:', e.message);
@@ -1132,7 +1364,8 @@ async function selectAndAccept(minWaitHours = 24, providedState = null) {
 
     try {
       const webId = state.bountyId + stateChain.idOffset;
-      const explanation = `accepted claim #${winner.id} on my poidh bounty "${state.bountyName}" — score ${winner.score}/30\n\n${winner.reasoning}`;
+      const winnerTag2 = winner.username ? `@${winner.username}'s` : `"${(winner.name || '').slice(0, 30)}"`;
+      const explanation = `accepted ${winnerTag2} submission on "${state.bountyName}" — score ${winner.score}/30\n\n${winner.reasoning}`;
       await postToFarcaster(explanation, 'poidh', [{ url: `${stateChain.url}/bounty/${webId}` }]);
       appendLog({ event: 'farcaster_explanation', bountyId: state.bountyId });
     } catch (e) {
@@ -1145,7 +1378,7 @@ async function selectAndAccept(minWaitHours = 24, providedState = null) {
     try {
       const webId = state.bountyId + stateChain.idOffset;
       await replyToFarcaster(state.castHash, state.authorFid,
-        `winner picked for your bounty "${state.bountyName}"! claim #${winner.id} — score ${winner.score}/30`,
+        `winner picked for your bounty "${state.bountyName}"! ${winner.username ? `@${winner.username}` : `"${(winner.name || '').slice(0, 30)}"`} wins with ${winner.score}/30`,
         [{ url: `${stateChain.url}/bounty/${webId}` }]);
     } catch (e) { /* ignore */ }
   }
@@ -1204,7 +1437,8 @@ async function acceptSpecificClaim(claimId, targetBountyId = null) {
     saveState(state);
     appendLog({ event: 'vote_submitted_user', claimId, txHash: tx.hash });
     try {
-      await postToFarcaster(`submitted claim #${claimId} for vote on bounty "${state.bountyName}" (user-selected)\n\ncontributors have 2 days to vote`, 'poidh', [{ url: `${stateChain.url}/bounty/${webId}` }]);
+      const claimLabel = claim.username ? `@${claim.username}'s` : `"${(claim.name || '').slice(0, 30)}"`;
+      await postToFarcaster(`submitted ${claimLabel} submission for vote on "${state.bountyName}" (user-selected)\n\ncontributors have 2 days to vote`, 'poidh', [{ url: `${stateChain.url}/bounty/${webId}` }]);
     } catch (e) { /* ignore */ }
   } else {
     const tx = await contract.acceptClaim(state.bountyId, claimId);
@@ -1217,7 +1451,8 @@ async function acceptSpecificClaim(claimId, targetBountyId = null) {
     saveState(state);
     appendLog({ event: 'claim_accepted_user', claimId, txHash: tx.hash });
     try {
-      await postToFarcaster(`accepted claim #${claimId} on bounty "${state.bountyName}" (selected by bounty creator)`, 'poidh', [{ url: `${stateChain.url}/bounty/${webId}` }]);
+      const claimLabel2 = claim.username ? `@${claim.username}'s` : `"${(claim.name || '').slice(0, 30)}"`;
+      await postToFarcaster(`accepted ${claimLabel2} submission on "${state.bountyName}" (selected by bounty creator)`, 'poidh', [{ url: `${stateChain.url}/bounty/${webId}` }]);
     } catch (e) { /* ignore */ }
   }
 
@@ -1225,7 +1460,7 @@ async function acceptSpecificClaim(claimId, targetBountyId = null) {
   if (state.castHash && state.authorFid) {
     try {
       await replyToFarcaster(state.castHash, state.authorFid,
-        `claim #${claimId} has been accepted on your bounty "${state.bountyName}"!`,
+        `a submission has been accepted on your bounty "${state.bountyName}"!`,
         [{ url: `${stateChain.url}/bounty/${webId}` }]);
     } catch (e) { /* ignore */ }
   }
@@ -1269,7 +1504,8 @@ async function resolveOpenVote() {
 
     try {
       const webId = state.bountyId + stateChain.idOffset;
-      await postToFarcaster(`vote resolved on bounty "${state.bountyName}" — claim #${state.winner.id} wins!\n\nyes: ${yesWeight}, no: ${noWeight}`, 'poidh', [{ url: `${stateChain.url}/bounty/${webId}` }]);
+      const voteWinnerTag = state.winner.username ? `@${state.winner.username}` : `"${(state.winner.name || '').slice(0, 30)}"`;
+      await postToFarcaster(`vote resolved on "${state.bountyName}" — ${voteWinnerTag} wins!\n\nyes: ${yesWeight}, no: ${noWeight}`, 'poidh', [{ url: `${stateChain.url}/bounty/${webId}` }]);
     } catch (e) {
       console.error('Farcaster resolve post failed:', e.message);
     }
@@ -1378,9 +1614,12 @@ function parseBountyArg(args) {
       case 'start':
         await createBounty(parseStartArgs(args));
         break;
-      case 'monitor':
-        await monitorAndEvaluate(targetBounty);
+      case 'monitor': {
+        const replyToHash = args[args.indexOf('--reply-to') + 1] || null;
+        const replyToFid = parseInt(args[args.indexOf('--reply-fid') + 1]) || 0;
+        await monitorAndEvaluate(targetBounty, replyToHash, replyToFid);
         break;
+      }
       case 'select-winner': {
         const state = targetBounty ? findBounty(targetBounty) : loadState();
         if (!state || state.phase !== 'monitoring') { console.log('No matching bounty in monitoring phase.'); break; }

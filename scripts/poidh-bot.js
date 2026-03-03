@@ -1054,6 +1054,7 @@ async function monitorSingleBounty(state, replyToHash, replyToFid) {
 
     state.evaluatedClaims.push({
       id: claimId,
+      onChainId: claim.onChainId || null,
       issuer: claim.issuer,
       name: claim.name,
       description: claim.description,
@@ -1317,6 +1318,24 @@ async function selectAndAccept(minWaitHours = 24, providedState = null) {
   console.log(`  Score: ${winner.score}/30`);
   console.log(`  Reasoning: ${winner.reasoning}`);
 
+  // Resolve on-chain claim ID (web ID != on-chain ID on Base)
+  let onChainClaimId = winner.onChainId;
+  if (!onChainClaimId) {
+    // Fetch from web API to get onChainId
+    const webBId = state.bountyId + stateChain.idOffset;
+    const freshClaims = await fetchClaimsFromWeb(webBId, stateChain.chainId);
+    const match = freshClaims && freshClaims.find(c => c.id === winner.id);
+    if (match && match.onChainId) {
+      onChainClaimId = match.onChainId;
+      winner.onChainId = onChainClaimId;
+      saveState(state);
+    } else {
+      console.error(`Cannot resolve on-chain claim ID for web claim #${winner.id}. Aborting.`);
+      return;
+    }
+  }
+  console.log(`On-chain claim ID: ${onChainClaimId} (web: ${winner.id})`);
+
   // Determine acceptance path: solo (direct accept) vs open with contributors (vote flow)
   let needsVote = false;
   try {
@@ -1328,7 +1347,7 @@ async function selectAndAccept(minWaitHours = 24, providedState = null) {
   if (needsVote) {
     // Open bounty vote flow
     console.log('\nOpen bounty with external contributors — submitting claim for vote...');
-    const tx = await contract.submitClaimForVote(state.bountyId, winner.id);
+    const tx = await contract.submitClaimForVote(state.bountyId, onChainClaimId);
     console.log(`TX: ${tx.hash}`);
     await tx.wait();
     console.log('Claim submitted for vote. Contributors have 2 days to vote.');
@@ -1338,7 +1357,7 @@ async function selectAndAccept(minWaitHours = 24, providedState = null) {
     state.phase = 'voting';
     state.voteSubmittedAt = new Date().toISOString();
     saveState(state);
-    appendLog({ event: 'vote_submitted', claimId: winner.id, txHash: tx.hash });
+    appendLog({ event: 'vote_submitted', claimId: onChainClaimId, txHash: tx.hash });
 
     try {
       const webId = state.bountyId + stateChain.idOffset;
@@ -1351,7 +1370,7 @@ async function selectAndAccept(minWaitHours = 24, providedState = null) {
   } else {
     // Solo bounty or open with no external contributors — direct accept
     console.log('\nAccepting claim on-chain...');
-    const tx = await contract.acceptClaim(state.bountyId, winner.id);
+    const tx = await contract.acceptClaim(state.bountyId, onChainClaimId);
     console.log(`TX: ${tx.hash}`);
     await tx.wait();
     console.log('Claim accepted!');
@@ -1360,7 +1379,7 @@ async function selectAndAccept(minWaitHours = 24, providedState = null) {
     state.acceptTxHash = tx.hash;
     state.phase = 'accepted';
     saveState(state);
-    appendLog({ event: 'claim_accepted', claimId: winner.id, txHash: tx.hash, score: winner.score });
+    appendLog({ event: 'claim_accepted', claimId: onChainClaimId, txHash: tx.hash, score: winner.score });
 
     try {
       const webId = state.bountyId + stateChain.idOffset;
@@ -1415,7 +1434,19 @@ async function acceptSpecificClaim(claimId, targetBountyId = null) {
     }
   }
 
-  console.log(`Accepting user-selected claim #${claimId}...`);
+  // Resolve on-chain claim ID
+  let onChainCId = claim.onChainId;
+  if (!onChainCId) {
+    const freshClaims = await fetchClaimsFromWeb(webId, stateChain.chainId);
+    const match = freshClaims && freshClaims.find(c => c.id === claimId);
+    if (match && match.onChainId) {
+      onChainCId = match.onChainId;
+    } else {
+      console.error(`Cannot resolve on-chain claim ID for web claim #${claimId}. Aborting.`);
+      return;
+    }
+  }
+  console.log(`Accepting user-selected claim #${claimId} (on-chain: ${onChainCId})...`);
 
   let needsVote = false;
   try {
@@ -1426,7 +1457,7 @@ async function acceptSpecificClaim(claimId, targetBountyId = null) {
 
   if (needsVote) {
     console.log('Open bounty with external contributors — submitting claim for vote...');
-    const tx = await contract.submitClaimForVote(state.bountyId, claimId);
+    const tx = await contract.submitClaimForVote(state.bountyId, onChainCId);
     console.log(`TX: ${tx.hash}`);
     await tx.wait();
     console.log('Claim submitted for vote. Contributors have 2 days to vote.');
@@ -1435,13 +1466,13 @@ async function acceptSpecificClaim(claimId, targetBountyId = null) {
     state.phase = 'voting';
     state.voteSubmittedAt = new Date().toISOString();
     saveState(state);
-    appendLog({ event: 'vote_submitted_user', claimId, txHash: tx.hash });
+    appendLog({ event: 'vote_submitted_user', claimId: onChainCId, txHash: tx.hash });
     try {
       const claimLabel = claim.username ? `@${claim.username}'s` : `"${(claim.name || '').slice(0, 30)}"`;
       await postToFarcaster(`submitted ${claimLabel} submission for vote on "${state.bountyName}" (user-selected)\n\ncontributors have 2 days to vote`, 'poidh', [{ url: `${stateChain.url}/bounty/${webId}` }]);
     } catch (e) { /* ignore */ }
   } else {
-    const tx = await contract.acceptClaim(state.bountyId, claimId);
+    const tx = await contract.acceptClaim(state.bountyId, onChainCId);
     console.log(`TX: ${tx.hash}`);
     await tx.wait();
     console.log(`Claim #${claimId} accepted!`);
